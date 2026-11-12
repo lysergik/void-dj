@@ -1,0 +1,881 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d0b0cdd..9320bc5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1231,6 +1231,7 @@ add_library(mixxx-lib STATIC EXCLUDE_FROM_ALL
+   src/util/readaheadsamplebuffer.cpp
+   src/util/ringdelaybuffer.cpp
+   src/util/rotary.cpp
++  src/util/rtscheduling.cpp
+   src/util/runtimeloggingcategory.cpp
+   src/util/safelywritablefile.cpp
+   src/util/sample.cpp
+@@ -1500,6 +1501,7 @@ target_precompile_headers(mixxx-lib PUBLIC
+   src/util/reference.h
+   src/util/regex.h
+   src/util/rescaler.h
++  src/util/rtscheduling.h
+   src/util/ringdelaybuffer.h
+   src/util/rotary.h
+   src/util/runtimeloggingcategory.h
+diff --git a/src/analyzer/analyzerthread.cpp b/src/analyzer/analyzerthread.cpp
+index 4273c7b..721b363 100644
+--- a/src/analyzer/analyzerthread.cpp
++++ b/src/analyzer/analyzerthread.cpp
+@@ -17,6 +17,7 @@
+ #include "util/db/dbconnectionpooled.h"
+ #include "util/db/dbconnectionpooler.h"
+ #include "util/logger.h"
++#include "util/rtscheduling.h"
+ 
+ namespace {
+ 
+@@ -88,6 +89,17 @@ AnalyzerThread::AnalyzerThread(
+ }
+ 
+ void AnalyzerThread::doRun() {
++    // Analysis is background work by definition. The threads that feed the
++    // audio callback its next chunk (CachingReaderWorker and the engine worker
++    // pool) share the same cores, so an analyzer left at the default weight
++    // competes head-on and the decks glitch audibly while a track is scanned.
++    // Done from inside the worker rather than through the QThread priority:
++    // QThread::LowPriority maps onto nothing under SCHED_OTHER, and the
++    // on-load analysis scheduler does not even request it. It must come before
++    // the first openAudioSource(): decoder threads inherit policy and nice.
++    const QByteArray threadName = name().toLocal8Bit();
++    mixxx::demoteCurrentThreadToBackground(threadName.constData());
++
+     std::unique_ptr<AnalysisDao> pAnalysisDao;
+     // The thread-local database connection  must not be closed
+     // before returning from this function.
+diff --git a/src/broadcast/broadcastmanager.cpp b/src/broadcast/broadcastmanager.cpp
+index 9977186..46eab29 100644
+--- a/src/broadcast/broadcastmanager.cpp
++++ b/src/broadcast/broadcastmanager.cpp
+@@ -35,11 +35,11 @@ BroadcastManager::BroadcastManager(SettingsManager* pSettingsManager,
+     // Initialize libshout
+     shout_init();
+ 
+-    // Initialize connections list from the current state of BroadcastSettings
+-    const QList<BroadcastProfilePtr> profiles = m_pBroadcastSettings->profiles();
+-    for (const BroadcastProfilePtr& profile : profiles) {
+-        addConnection(profile);
+-    }
++    // Initialize connections list from the current state of BroadcastSettings.
++    // Normally a no-op: the destructor forces [Shoutcast],enabled off, so
++    // broadcasting is off at every startup and connectionWanted() is false for
++    // every profile until the user turns it on.
++    addWantedConnections();
+ 
+     // Connect add/remove profiles signals.
+     // Passing the raw pointer from QSharedPointer to connect() is fine, since
+@@ -123,7 +123,9 @@ void BroadcastManager::slotControlEnabled(double v) {
+ }
+ 
+ void BroadcastManager::slotProfileAdded(BroadcastProfilePtr profile) {
+-    addConnection(profile);
++    if (connectionWanted(profile)) {
++        addConnection(profile);
++    }
+ }
+ 
+ void BroadcastManager::slotProfileRemoved(BroadcastProfilePtr profile) {
+@@ -131,6 +133,13 @@ void BroadcastManager::slotProfileRemoved(BroadcastProfilePtr profile) {
+ }
+ 
+ void BroadcastManager::slotProfilesChanged() {
++    // Connections are created on demand, so a profile that was just enabled (in
++    // the preferences, or by broadcasting being switched on) has none yet.
++    // Create those first: the loop below only walks existing connections. This
++    // is the single point every path that can newly want a connection passes
++    // through.
++    addWantedConnections();
++
+     const QVector<NetworkOutputStreamWorkerPtr> workers = m_pNetworkStream->outputWorkers();
+     for (const NetworkOutputStreamWorkerPtr& pWorker : workers) {
+         ShoutConnectionPtr connection = qSharedPointerCast<ShoutConnection>(pWorker);
+@@ -145,6 +154,26 @@ void BroadcastManager::slotProfilesChanged() {
+     }
+ }
+ 
++// A ShoutConnection is not a passive object. addConnection() registers it with
++// EngineNetworkStream, and SoundDeviceNetwork::writeProcess() walks every
++// registered worker from inside the audio callback, so a connection that can
++// never connect still costs work on the RT thread on every buffer. Upstream
++// created one for every profile at startup and kept it for the whole session.
++// Create one only while it could actually be used.
++bool BroadcastManager::connectionWanted(const BroadcastProfilePtr& profile) const {
++    return profile && profile->getEnabled() && m_pBroadcastEnabled->toBool();
++}
++
++void BroadcastManager::addWantedConnections() {
++    const QList<BroadcastProfilePtr> profiles = m_pBroadcastSettings->profiles();
++    for (const BroadcastProfilePtr& profile : profiles) {
++        if (connectionWanted(profile)) {
++            // Already-connected profiles are rejected by addConnection itself.
++            addConnection(profile);
++        }
++    }
++}
++
+ bool BroadcastManager::addConnection(BroadcastProfilePtr profile) {
+     if (!profile) {
+         return false;
+diff --git a/src/broadcast/broadcastmanager.h b/src/broadcast/broadcastmanager.h
+index 5a6c083..9525091 100644
+--- a/src/broadcast/broadcastmanager.h
++++ b/src/broadcast/broadcastmanager.h
+@@ -45,6 +45,8 @@ class BroadcastManager : public QObject {
+     void slotConnectionStatusChanged(int newState);
+ 
+   private:
++    bool connectionWanted(const BroadcastProfilePtr& profile) const;
++    void addWantedConnections();
+     bool addConnection(BroadcastProfilePtr profile);
+     bool removeConnection(BroadcastProfilePtr profile);
+     ShoutConnectionPtr findConnectionForProfile(BroadcastProfilePtr profile);
+diff --git a/src/engine/cachingreader/cachingreader.cpp b/src/engine/cachingreader/cachingreader.cpp
+index 252252f..4e77fc3 100644
+--- a/src/engine/cachingreader/cachingreader.cpp
++++ b/src/engine/cachingreader/cachingreader.cpp
+@@ -58,6 +58,7 @@ CachingReader::CachingReader(const QString& group,
+           m_mruCachingReaderChunk(nullptr),
+           m_lruCachingReaderChunk(nullptr),
+           m_sampleBuffer(CachingReaderChunk::kSamples * kNumberOfCachedChunksInMemory),
++          m_readRequestsInFlight(0),
+           m_worker(group, &m_chunkReadRequestFIFO, &m_readerStatusUpdateFIFO) {
+     m_allocatedCachingReaderChunks.reserve(kNumberOfCachedChunksInMemory);
+     // Divide up the allocated raw memory buffer into total_chunks
+@@ -88,6 +89,8 @@ CachingReader::CachingReader(const QString& group,
+             this, &CachingReader::trackSourceUnavailable,
+             Qt::DirectConnection);
+ 
++    // Must not be InheritPriority (that could hand this thread an RT policy by
++    // accident). The real priority is set by the worker itself in run().
+     m_worker.start(QThread::HighPriority);
+ }
+ 
+@@ -227,6 +230,9 @@ void CachingReader::process() {
+     while (m_readerStatusUpdateFIFO.read(&update, 1) == 1) {
+         auto* pChunk = update.takeFromWorker();
+         if (pChunk) {
++            // Every request comes back exactly once, read or discarded
++            DEBUG_ASSERT(m_readRequestsInFlight > 0);
++            --m_readRequestsInFlight;
+             // Result of a read request (with a chunk)
+             DEBUG_ASSERT(atomicLoadRelaxed(m_state) != STATE_IDLE);
+             DEBUG_ASSERT(
+@@ -452,7 +458,11 @@ CachingReader::ReadResult CachingReader::read(SINT startSample, SINT numSamples,
+                     // pending.
+                     DEBUG_ASSERT(!pChunk ||
+                             (pChunk->getState() == CachingReaderChunkForOwner::READ_PENDING));
+-                    Counter("CachingReader::read(): Failed to read chunk on cache miss")++;
++                    // QStringLiteral: a plain literal would allocate a QString in
++                    // the audio callback on every miss, and a fast search misses
++                    // every callback.
++                    Counter(QStringLiteral(
++                            "CachingReader::read(): Failed to read chunk on cache miss"))++;
+                     if (kLogger.traceEnabled()) {
+                         kLogger.trace()
+                                 << "Cache miss for chunk with index"
+@@ -518,12 +528,27 @@ CachingReader::ReadResult CachingReader::read(SINT startSample, SINT numSamples,
+     return result;
+ }
+ 
+-void CachingReader::hintAndMaybeWake(const HintVector& hintList) {
++void CachingReader::hintAndMaybeWake(const HintVector& hintList, bool fastSearch) {
+     // If no file is loaded, skip.
+     if (atomicLoadRelaxed(m_state) != STATE_TRACK_LOADED) {
+         return;
+     }
+ 
++    // During a fast search the playhead passes several chunks per callback, so
++    // every callback hints chunks that are not cached yet. Left alone that
++    // queues a new seek-and-decode per callback, the FIFO fills, and the worker
++    // keeps decoding chunks the deck has long since passed -- for seconds after
++    // the wheel stops, at the expense of the playing deck. Pick up results first
++    // so the count below is current, then keep a single request in flight: the
++    // next one is issued from wherever the playhead is by the time the last one
++    // comes back, which is all a search can play anyway.
++    if (fastSearch) {
++        process();
++        if (m_readRequestsInFlight > 0) {
++            return;
++        }
++    }
++
+     // For every chunk that the hints indicated, check if it is in the cache. If
+     // any are not, then wake.
+     bool shouldWake = false;
+@@ -577,18 +602,30 @@ void CachingReader::hintAndMaybeWake(const HintVector& hintList) {
+                 // because it will be handed over to the worker immediately
+                 CachingReaderChunkReadRequest request;
+                 request.giveToWorker(pChunk);
++                request.speculative = fastSearch;
+                 if (kLogger.traceEnabled()) {
+                     kLogger.trace()
+                             << "Requesting read of chunk"
+                             << request.chunk;
+                 }
+                 if (m_chunkReadRequestFIFO.write(&request, 1) != 1) {
+-                    kLogger.warning()
+-                            << "Failed to submit read request for chunk"
+-                            << chunkIndex;
+                     // Revoke the chunk from the worker and free it
+                     pChunk->takeFromWorker();
+                     freeChunk(pChunk);
++                    // The worker is behind (typically a stalled USB read) and
++                    // its queue is full, so every remaining chunk of every
++                    // remaining hint would fail the same way. Logging each one
++                    // allocates in the audio callback, once per callback for as
++                    // long as the stall lasts. Hints are ordered by urgency, so
++                    // stop here: the next callback re-hints whatever is still
++                    // missing once the worker has drained.
++                    m_worker.workReady();
++                    return;
++                }
++                ++m_readRequestsInFlight;
++                if (fastSearch) {
++                    m_worker.workReady();
++                    return;
+                 }
+             } else if (pChunk->getState() == CachingReaderChunkForOwner::READY) {
+                 // This will cause the chunk to be 'freshened' in the cache. The
+diff --git a/src/engine/cachingreader/cachingreader.h b/src/engine/cachingreader/cachingreader.h
+index 9f32b9c..4149d89 100644
+--- a/src/engine/cachingreader/cachingreader.h
++++ b/src/engine/cachingreader/cachingreader.h
+@@ -106,7 +106,12 @@ class CachingReader : public QObject {
+     // that is not in the cache. If any hints do request a chunk not in cache,
+     // then wake the reader so that it can process them. Must only be called
+     // from the engine callback.
+-    void hintAndMaybeWake(const HintVector& hintList);
++    //
++    // fastSearch says the playhead is moving far faster than any decoder keeps
++    // up with (e.g. SHIFT+jog search at tens of times normal speed). Then at
++    // most one read request is kept in flight and it is decoded off the
++    // real-time ladder: see the implementation and CachingReaderWorker::run().
++    void hintAndMaybeWake(const HintVector& hintList, bool fastSearch = false);
+ 
+     // Request that the CachingReader load a new track. These requests are
+     // processed in the work thread, so the reader must be woken up via wake()
+@@ -127,6 +132,8 @@ class CachingReader : public QObject {
+     void trackSourceUnavailable(TrackPointer pTrack);
+ 
+   private:
++    friend class CachingReaderFastSearchTest;
++
+     const UserSettingsPointer m_pConfig;
+ 
+     // Thread-safe FIFOs for communication between the engine callback and
+@@ -188,5 +195,9 @@ class CachingReader : public QObject {
+     // The readable frame index range as reported by the worker.
+     mixxx::IndexRange m_readableFrameIndexRange;
+ 
++    // Read requests handed to the worker whose chunk has not come back
++    // through process() yet. Engine thread only.
++    int m_readRequestsInFlight;
++
+     CachingReaderWorker m_worker;
+ };
+diff --git a/src/engine/cachingreader/cachingreaderworker.cpp b/src/engine/cachingreader/cachingreaderworker.cpp
+index 64f1ad5..929c23b 100644
+--- a/src/engine/cachingreader/cachingreaderworker.cpp
++++ b/src/engine/cachingreader/cachingreaderworker.cpp
+@@ -13,6 +13,7 @@
+ #include "util/event.h"
+ #include "util/fifo.h"
+ #include "util/logger.h"
++#include "util/rtscheduling.h"
+ #include "util/span.h"
+ 
+ namespace {
+@@ -31,7 +32,8 @@ CachingReaderWorker::CachingReaderWorker(
+         : m_group(group),
+           m_tag(QString("CachingReaderWorker %1").arg(m_group)),
+           m_pChunkReadRequestFIFO(pChunkReadRequestFIFO),
+-          m_pReaderStatusFIFO(pReaderStatusFIFO) {
++          m_pReaderStatusFIFO(pReaderStatusFIFO),
++          m_realtime(false) {
+ }
+ 
+ ReaderStatusUpdate CachingReaderWorker::processReadRequest(
+@@ -135,6 +137,21 @@ void CachingReaderWorker::run() {
+     QThread::currentThread()->setObjectName(
+             QStringLiteral("CachingReaderWorker ") + QString::number(id));
+ 
++    // This thread is the only thing standing between the audio callback and
++    // the disk: it decodes the chunk the deck is about to play. The
++    // QThread::HighPriority CachingReader passes to start() is a no-op under
++    // SCHED_OTHER on Linux, which leaves the fetch competing on equal terms
++    // with track analysis and preemptable by the GUI thread; a repaint delaying
++    // samples that are due in a few milliseconds is what a cache miss sounds
++    // like. Take a real rung just below the engine (util/rtscheduling.h).
++    //
++    // Steady-state chunk reads are lock-free (both FIFOs), so this does not
++    // invert against anything. loadTrack() is the exception (global track cache
++    // locks shared with the analyzers); those are demoted, not SCHED_IDLE, so
++    // they keep making progress and release the lock.
++    m_realtime = mixxx::promoteCurrentThreadToRealtime(
++            mixxx::kRtPrioTrackReader, "CachingReaderWorker");
++
+     Event::start(m_tag);
+     while (!m_stop.loadAcquire()) {
+         // Request is initialized by reading from FIFO
+@@ -155,8 +172,24 @@ void CachingReaderWorker::run() {
+                 unloadTrack();
+             }
+         } else if (m_pChunkReadRequestFIFO->read(&request, 1) == 1) {
++            // While a deck fast-searches, every chunk is a fresh seek plus a
++            // decode and the decoder never catches up: the read is pure CPU,
++            // back to back, for as long as the wheel turns. At RT priority that
++            // would take a whole core per searching deck away from the GUI, the
++            // controller thread and the kernel threads doing the USB reads the
++            // *playing* deck depends on. Those chunks are mostly passed before
++            // they are decoded anyway, so they get no claim on RT priority:
++            // decode them on SCHED_OTHER and step back up before the next
++            // request, which may be the deck resuming normal playback.
++            const bool demote = m_realtime && request.speculative &&
++                    mixxx::setCurrentThreadRealtimeQuietly(
++                            false, mixxx::kRtPrioTrackReader);
+             // Read the requested chunk and send the result
+             const ReaderStatusUpdate update = processReadRequest(request);
++            if (demote) {
++                mixxx::setCurrentThreadRealtimeQuietly(
++                        true, mixxx::kRtPrioTrackReader);
++            }
+             m_pReaderStatusFIFO->writeBlocking(&update, 1);
+         } else {
+             Event::end(m_tag);
+diff --git a/src/engine/cachingreader/cachingreaderworker.h b/src/engine/cachingreader/cachingreaderworker.h
+index 7f29642..f76a68f 100644
+--- a/src/engine/cachingreader/cachingreaderworker.h
++++ b/src/engine/cachingreader/cachingreaderworker.h
+@@ -16,10 +16,15 @@ class FIFO;
+ // POD with trivial ctor/dtor/copy for passing through FIFO
+ typedef struct CachingReaderChunkReadRequest {
+     CachingReaderChunk* chunk;
++    // Requested while the deck was fast-searching, where the playhead outruns
++    // the decoder and most of what is read is never heard. The worker decodes
++    // these off the real-time ladder, see run().
++    bool speculative;
+ 
+     void giveToWorker(CachingReaderChunkForOwner* chunkForOwner) {
+         DEBUG_ASSERT(chunkForOwner);
+         chunk = chunkForOwner;
++        speculative = false;
+         chunkForOwner->giveToWorker();
+     }
+ } CachingReaderChunkReadRequest;
+@@ -165,4 +170,8 @@ class CachingReaderWorker : public EngineWorker {
+     mixxx::SampleBuffer m_tempReadBuffer;
+ 
+     QAtomicInt m_stop;
++
++    // Whether run() got its SCHED_FIFO rung, i.e. whether there is a realtime
++    // priority to step down from for speculative reads (and back up to).
++    bool m_realtime;
+ };
+diff --git a/src/engine/enginebuffer.cpp b/src/engine/enginebuffer.cpp
+index 84a9718..e411d25 100644
+--- a/src/engine/enginebuffer.cpp
++++ b/src/engine/enginebuffer.cpp
+@@ -52,6 +52,11 @@ constexpr SINT kSamplesPerFrame = 2; // Engine buffer uses Stereo frames only
+ // Rate at which the playpos slider is updated
+ constexpr int kPlaypositionUpdateRate = 15; // updates per second
+ 
++// Playback rate (in track frames per output frame) above which the deck counts
++// as fast-searching for the reader, see CachingReader::hintAndMaybeWake().
++// Twice the FWD/BACK search speed (4x) and far above anything musical.
++constexpr double kFastSearchRate = 8.0;
++
+ const QString kAppGroup = QStringLiteral("[App]");
+ 
+ } // anonymous namespace
+@@ -1691,7 +1696,7 @@ void EngineBuffer::hintReader(const double dRate) {
+     for (const auto& pControl : std::as_const(m_engineControls)) {
+         pControl->hintReader(&m_hintList);
+     }
+-    m_pReader->hintAndMaybeWake(m_hintList);
++    m_pReader->hintAndMaybeWake(m_hintList, fabs(dRate) > kFastSearchRate);
+ }
+ 
+ // WARNING: This method runs in the GUI thread
+diff --git a/src/engine/enginebuffer.h b/src/engine/enginebuffer.h
+index ea8675b..cef84a6 100644
+--- a/src/engine/enginebuffer.h
++++ b/src/engine/enginebuffer.h
+@@ -210,9 +210,13 @@ class EngineBuffer : public EngineObject {
+     }
+ 
+     constexpr static KeylockEngine defaultKeylockEngine() {
+-#ifdef __RUBBERBAND__
++#if defined(__RUBBERBAND__) && \
++        !(defined(__linux__) && (defined(__aarch64__) || defined(__arm__)))
+         return KeylockEngine::RubberBandFaster;
+ #else
++        // On Raspberry Pi class (ARM Linux) CPUs RubberBand's phase vocoder is
++        // too expensive for two decks; default to SoundTouch there. The engine
++        // stays selectable in the UI, and other platforms are unchanged.
+         return KeylockEngine::SoundTouch;
+ #endif
+     }
+diff --git a/src/engine/engineworkerscheduler.cpp b/src/engine/engineworkerscheduler.cpp
+index fdf3d01..0fc9bfc 100644
+--- a/src/engine/engineworkerscheduler.cpp
++++ b/src/engine/engineworkerscheduler.cpp
+@@ -4,6 +4,7 @@
+ #include "moc_engineworkerscheduler.cpp"
+ #include "util/compatibility/qmutex.h"
+ #include "util/event.h"
++#include "util/rtscheduling.h"
+ 
+ EngineWorkerScheduler::EngineWorkerScheduler(QObject* pParent)
+         : m_bWakeScheduler(false),
+@@ -43,6 +44,16 @@ void EngineWorkerScheduler::runWorkers() {
+ 
+ void EngineWorkerScheduler::run() {
+     static const QString tag("EngineWorkerScheduler");
++
++    // The wake-up hop between the audio callback and CachingReaderWorker. All
++    // it does per callback is walk the worker list and wake whoever is ready,
++    // but on SCHED_OTHER (EngineMixer's QThread::HighPriority means nothing
++    // there) a busy GUI thread on the same core can sit in front of it and
++    // delay every chunk fetch. Runs one rung above the worker it wakes, see
++    // util/rtscheduling.h. Best effort: needs an rtprio rlimit.
++    mixxx::promoteCurrentThreadToRealtime(
++            mixxx::kRtPrioEngineWorkerScheduler, "EngineWorkerScheduler");
++
+     bool quit = false;
+     while (!quit) {
+         Event::start(tag);
+diff --git a/src/main.cpp b/src/main.cpp
+index 11afd51..231a910 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -27,6 +27,7 @@
+ #include "util/cmdlineargs.h"
+ #include "util/console.h"
+ #include "util/logging.h"
++#include "util/rtscheduling.h"
+ #include "util/sandbox.h"
+ #include "util/versionstore.h"
+ 
+@@ -169,6 +170,13 @@ void applyStyleOverride(CmdlineArgs* pArgs) {
+ int main(int argc, char * argv[]) {
+     Console console;
+ 
++    // Optional, best-effort real-time tuning for the audio path (see
++    // util/rtscheduling.h and docs/LINUX-RASPBERRY-PI.md). Both are no-ops
++    // unless the system grants them (memlock unlimited / NAUTICMIXXX_RT_MAIN=1),
++    // and must happen before threads spawn and the heap grows.
++    mixxx::lockAllMemoryIfPermitted();
++    mixxx::promoteMainThreadIfRequested();
++
+     // These need to be set early on (not sure how early) in order to trigger
+     // logic in the OS X appstore support patch from QTBUG-16549.
+     QCoreApplication::setOrganizationDomain("mixxx.org");
+diff --git a/src/soundio/sounddeviceportaudio.cpp b/src/soundio/sounddeviceportaudio.cpp
+index 391efd7..947f7df 100644
+--- a/src/soundio/sounddeviceportaudio.cpp
++++ b/src/soundio/sounddeviceportaudio.cpp
+@@ -5,6 +5,7 @@
+ #include <QRegularExpression>
+ #include <QThread>
+ #include <QtDebug>
++#include <cstdlib>
+ 
+ #include "control/controlobject.h"
+ #include "sounddevicenetwork.h"
+@@ -15,6 +16,7 @@
+ #include "util/denormalsarezero.h"
+ #include "util/fifo.h"
+ #include "util/math.h"
++#include "util/rtscheduling.h"
+ #include "util/sample.h"
+ #include "util/timer.h"
+ #include "util/trace.h"
+@@ -25,6 +27,8 @@
+ #include <pa_linux_alsa.h>
+ // for sched_getscheduler
+ #include <sched.h>
++// for pthread_setname_np
++#include <pthread.h>
+ #endif
+ 
+ namespace {
+@@ -37,6 +41,33 @@ constexpr int kFifoSize = 2 * kDriftReserve + 1;
+ 
+ constexpr int kCpuUsageUpdateRate = 30; // in 1/s, fits to display frame rate
+ 
++// How many periods of output latency to request from ALSA on top of the period
++// being played. PortAudio's ALSA backend sizes the ring buffer as one period
++// plus the suggested latency, so requesting a single period (what Mixxx does
++// everywhere else) gives the minimum ring of two periods: one period between
++// the engine missing a callback deadline and an audible underrun. Two periods
++// give a three-period ring -- one more period of headroom for one more period
++// of output latency -- while the callback and every control change still run at
++// the configured period. Defaults to 2 on ARM (Raspberry Pi: USB audio plus a
++// busy GUI makes the extra headroom worth it) and 1 elsewhere; override with
++// NAUTICMIXXX_ALSA_LATENCY_PERIODS (1.0 - 4.0).
++double alsaLatencyPeriods() {
++#if defined(__aarch64__) || defined(__arm__)
++    double periods = 2.0;
++#else
++    double periods = 1.0;
++#endif
++    const char* value = std::getenv("NAUTICMIXXX_ALSA_LATENCY_PERIODS");
++    if (value && *value) {
++        char* end = nullptr;
++        const double parsed = std::strtod(value, &end);
++        if (end != value && *end == '\0' && parsed >= 1.0 && parsed <= 4.0) {
++            periods = parsed;
++        }
++    }
++    return periods;
++}
++
+ // We warn only at invalid timing 3, since the first two
+ // callbacks can be always wrong due to a setup/open jitter
+ constexpr int m_invalidTimeInfoWarningCount = 3;
+@@ -240,12 +271,17 @@ SoundDeviceStatus SoundDevicePortAudio::open(bool isClkRefDevice, int syncBuffer
+     // Fill out the rest of the info.
+     m_outputParams.device = m_deviceId.portAudioIndex;
+     m_outputParams.sampleFormat = paFloat32;
+-    m_outputParams.suggestedLatency = bufferMSec / 1000.0;
++    // The ring size depends on this, see alsaLatencyPeriods(). JACK sizes its
++    // own buffers.
++    const double latencyPeriods = m_deviceTypeId == paALSA ? alsaLatencyPeriods() : 1.0;
++    m_outputParams.suggestedLatency = latencyPeriods * bufferMSec / 1000.0;
+     m_outputParams.hostApiSpecificStreamInfo = nullptr;
+ 
+     m_inputParams.device  = m_deviceId.portAudioIndex;
+     m_inputParams.sampleFormat  = paFloat32;
+-    m_inputParams.suggestedLatency = bufferMSec / 1000.0;
++    // Matching the output keeps both directions of a duplex stream on the same
++    // period count.
++    m_inputParams.suggestedLatency = latencyPeriods * bufferMSec / 1000.0;
+     m_inputParams.hostApiSpecificStreamInfo = nullptr;
+ 
+     qDebug() << "Opening stream with id" << m_deviceId.portAudioIndex;
+@@ -952,6 +988,17 @@ int SoundDevicePortAudio::callbackProcessClkRef(
+ 
+     if (!m_bSetThreadPriority) {
+ #ifdef __LINUX__
++        // Name the engine callback thread at the OS level (comm, max 15 chars)
++        // so it can be told apart from the GUI thread in ps/top and pinned or
++        // chrt'ed by scripts: ps -T -o tid,comm | grep mixxx-engine
++        pthread_setname_np(pthread_self(), "mixxx-engine");
++
++        // PortAudio's ALSA host API (PaAlsa_EnableRealtimeScheduling) already
++        // starts this thread SCHED_FIFO, but at a priority of its own choosing.
++        // Re-set it explicitly so it sits above the reader and scheduler rungs.
++        mixxx::promoteCurrentThreadToRealtime(
++                mixxx::kRtPrioAudioEngine, "mixxx-engine");
++
+         // Verify if we are a thread with "real-time" policy.
+         // The audio thread on Linux should be set to SCHED_FIFO with a priority
+         // that's somewhere between 60 and 90 depending on the allowed priority
+@@ -960,6 +1007,11 @@ int SoundDevicePortAudio::callbackProcessClkRef(
+         if ((sched_getscheduler(0) & SCHED_FIFO) == 0) {
+             qWarning() << "Engine thread not scheduled with the real-time policy SCHED_FIFO";
+         }
++
++        // Move onto an isolated audio core when the launcher asks for it
++        // (e.g. NAUTICMIXXX_ENGINE_CPU=3 together with isolcpus=3).
++        mixxx::pinCurrentThreadToCpuFromEnv(
++                "NAUTICMIXXX_ENGINE_CPU", "mixxx-engine");
+ #else
+         // Turn on TimeCritical priority for the callback thread.
+         // If we are running in Linux this will have no effect. Either the thread is
+diff --git a/src/util/db/dbconnection.cpp b/src/util/db/dbconnection.cpp
+index e39c546..287f4d7 100644
+--- a/src/util/db/dbconnection.cpp
++++ b/src/util/db/dbconnection.cpp
+@@ -1,5 +1,6 @@
+ #include <QSqlDriver>
+ #include <QSqlError>
++#include <QSqlQuery>
+ 
+ #ifdef __SQLITE3__
+ #include <sqlite3.h>
+@@ -232,8 +233,33 @@ void sqliteLikeUtf8(sqlite3_context* context,
+ 
+ #endif // __SQLITE3__
+ 
++// Put the library database in write-ahead-log mode.
++//
++// In the default rollback-journal mode a writer that has spilled its page cache
++// holds an EXCLUSIVE lock until it commits, and every other connection --
++// including the GUI thread's -- blocks on SQLite's busy handler until then, and
++// every commit costs several fsyncs on the SD card. Under WAL readers and a
++// writer never block each other and commits append to one file, so a USB
++// export scan or a cue/loop save no longer freezes a tap that only reads.
++//
++// journal_mode is persisted in the database header, so this is a no-op after
++// the first run. In-memory databases (the tests) silently stay in "memory".
++void enableWriteAheadLogging(const QSqlDatabase& database) {
++    QSqlQuery query(database);
++    if (!query.exec(QStringLiteral("PRAGMA journal_mode=WAL"))) {
++        kLogger.warning()
++                << "Failed to enable WAL journal mode:"
++                << query.lastError();
++        return;
++    }
++    if (query.next() && kLogger.debugEnabled()) {
++        kLogger.debug() << "SQLite journal mode:" << query.value(0).toString();
++    }
++}
++
+ bool initDatabase(const QSqlDatabase& database, mixxx::StringCollator* pCollator) {
+     DEBUG_ASSERT(database.isOpen());
++    enableWriteAheadLogging(database);
+ #ifdef __SQLITE3__
+     QVariant v = database.driver()->handle();
+     VERIFY_OR_DEBUG_ASSERT(v.isValid()) {
+diff --git a/src/util/rtscheduling.cpp b/src/util/rtscheduling.cpp
+new file mode 100644
+index 0000000..e4a5ffd
+--- /dev/null
++++ b/src/util/rtscheduling.cpp
+@@ -0,0 +1,173 @@
++#include "util/rtscheduling.h"
++
++#include <QThread>
++#include <QThreadPool>
++#include <QtDebug>
++#include <atomic>
++
++#ifdef __LINUX__
++#include <pthread.h>
++#include <sched.h>
++#include <sys/mman.h>
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <cstdlib>
++#include <cstring>
++#endif
++
++namespace mixxx {
++
++#ifdef __LINUX__
++namespace {
++
++constexpr int kNiceLowest = 19;
++
++// ioprio_set(2) has no glibc wrapper. who == 0 is the calling thread.
++constexpr int kIoprioWhoProcess = 1;
++constexpr int kIoprioClassShift = 13;
++constexpr int kIoprioClassBestEffort = 2;
++constexpr int kIoprioBestEffortLowest = 7;
++
++bool envIsFalse(const char* name) {
++    const char* value = std::getenv(name);
++    return value != nullptr && std::strcmp(value, "0") == 0;
++}
++
++bool envIsTrue(const char* name) {
++    const char* value = std::getenv(name);
++    return value != nullptr && std::strcmp(value, "1") == 0;
++}
++
++std::atomic<bool> s_warnedAboutRealtime{false};
++
++} // namespace
++#endif
++
++bool promoteCurrentThreadToRealtime(int priority, const char* threadName) {
++#ifdef __LINUX__
++    if (envIsFalse("NAUTICMIXXX_RT")) {
++        return false;
++    }
++    sched_param param{};
++    param.sched_priority = priority;
++    const int err = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
++    if (err == 0) {
++        qInfo() << "Thread" << threadName
++                << "scheduled with SCHED_FIFO priority" << priority;
++        return true;
++    }
++    if (!s_warnedAboutRealtime.exchange(true)) {
++        qWarning() << "Could not use real-time scheduling for thread"
++                   << threadName << ":" << strerror(err)
++                   << "- add your user to the audio group / raise the rtprio"
++                      " rlimit (see docs/LINUX-RASPBERRY-PI.md)";
++    }
++    return false;
++#else
++    Q_UNUSED(priority);
++    Q_UNUSED(threadName);
++    return false;
++#endif
++}
++
++bool setCurrentThreadRealtimeQuietly(bool realtime, int priority) {
++#ifdef __LINUX__
++    sched_param param{};
++    param.sched_priority = realtime ? priority : 0;
++    return pthread_setschedparam(pthread_self(),
++                   realtime ? SCHED_FIFO : SCHED_OTHER,
++                   &param) == 0;
++#else
++    Q_UNUSED(realtime);
++    Q_UNUSED(priority);
++    return false;
++#endif
++}
++
++bool demoteCurrentThreadToBackground(const char* threadName) {
++#ifdef __LINUX__
++    bool batched = false;
++#ifdef SCHED_BATCH
++    sched_param param{};
++    param.sched_priority = 0;
++    batched = pthread_setschedparam(pthread_self(), SCHED_BATCH, &param) == 0;
++#endif
++    // Nice values are per-thread on Linux (who == 0 is the calling thread).
++    const bool reniced = setpriority(PRIO_PROCESS, 0, kNiceLowest) == 0;
++    if (!batched && !reniced) {
++        return false;
++    }
++    constexpr int ioprio =
++            (kIoprioClassBestEffort << kIoprioClassShift) | kIoprioBestEffortLowest;
++    syscall(SYS_ioprio_set, kIoprioWhoProcess, 0, ioprio); // best effort
++    qInfo() << "Thread" << threadName << "scheduled as background work";
++    return true;
++#else
++    Q_UNUSED(threadName);
++    return false;
++#endif
++}
++
++bool pinCurrentThreadToCpuFromEnv(const char* envVar, const char* threadName) {
++#ifdef __LINUX__
++    // Plain getenv/strtol, no QByteArray: this may run inside the first audio
++    // callback and must not allocate.
++    const char* value = std::getenv(envVar);
++    if (value == nullptr || *value == '\0') {
++        return false;
++    }
++    char* end = nullptr;
++    const long cpu = std::strtol(value, &end, 10);
++    if (end == value || *end != '\0' || cpu < 0 || cpu >= CPU_SETSIZE) {
++        return false;
++    }
++    cpu_set_t set;
++    CPU_ZERO(&set);
++    CPU_SET(static_cast<int>(cpu), &set);
++    return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
++#else
++    Q_UNUSED(envVar);
++    Q_UNUSED(threadName);
++    return false;
++#endif
++}
++
++bool lockAllMemoryIfPermitted() {
++#ifdef __LINUX__
++    if (envIsFalse("NAUTICMIXXX_MLOCK")) {
++        return false;
++    }
++    rlimit limit{};
++    if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0 || limit.rlim_cur != RLIM_INFINITY) {
++        return false;
++    }
++#ifdef MCL_ONFAULT
++    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) == 0) {
++        qInfo() << "Locked process memory (mlockall, on fault)";
++        return true;
++    }
++#endif
++    return false;
++#else
++    return false;
++#endif
++}
++
++bool promoteMainThreadIfRequested() {
++#ifdef __LINUX__
++    if (!envIsTrue("NAUTICMIXXX_RT_MAIN")) {
++        return false;
++    }
++    // Threads spawned from an RT thread inherit its policy unless QThread gives
++    // them an explicit priority; keep QtConcurrent's pool on SCHED_OTHER.
++    QThreadPool::globalInstance()->setThreadPriority(QThread::NormalPriority);
++    return promoteCurrentThreadToRealtime(kRtPrioMainThread, "Main");
++#else
++    return false;
++#endif
++}
++
++} // namespace mixxx
+diff --git a/src/util/rtscheduling.h b/src/util/rtscheduling.h
+new file mode 100644
+index 0000000..bd775e2
+--- /dev/null
++++ b/src/util/rtscheduling.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++namespace mixxx {
++
++// Scheduling ladder for the latency-critical threads on Linux (Raspberry Pi).
++//
++// The audio callback must preempt everything else in the app, the two hops
++// between the callback and the disk (EngineWorkerScheduler -> CachingReader
++// worker) must preempt the GUI and library threads, and everything left on
++// SCHED_OTHER (analysis, library workers) must never delay them. All values are
++// below the audio/USB IRQ threads of a PREEMPT_RT / threadirqs kernel.
++//
++// Everything here is best-effort: it needs an rtprio rlimit or CAP_SYS_NICE
++// and silently degrades to the default scheduler when that is not granted.
++// Set NAUTICMIXXX_RT=0 to disable every promotion.
++constexpr int kRtPrioAudioEngine = 70;
++// SCHED_FIFO only preempts *strictly* lower priorities, so the scheduler sits
++// one rung above the reader it wakes: a wake-up for the next chunk never waits
++// behind the decode of the current one on the same core.
++constexpr int kRtPrioEngineWorkerScheduler = 62;
++constexpr int kRtPrioTrackReader = 60;
++// Opt-in only (NAUTICMIXXX_RT_MAIN=1), see promoteMainThreadIfRequested().
++constexpr int kRtPrioMainThread = 49;
++
++/// Best-effort promotion of the calling thread to SCHED_FIFO on Linux. QThread
++/// priorities are no-ops under SCHED_OTHER, so the threads feeding the audio
++/// callback need a real-time policy to reliably preempt GUI rendering. Logs a
++/// single warning the first time a promotion is refused. Returns false (no-op)
++/// on other platforms, when disabled through NAUTICMIXXX_RT=0, or when refused.
++bool promoteCurrentThreadToRealtime(int priority, const char* threadName);
++
++/// Switch the calling thread between SCHED_FIFO at `priority` (realtime) and
++/// plain SCHED_OTHER, silently. For a thread that changes class per work item.
++bool setCurrentThreadRealtimeQuietly(bool realtime, int priority);
++
++/// Demote the calling thread to background work: nice 19 under SCHED_BATCH and
++/// the weakest best-effort I/O priority. For long CPU-bound jobs (track
++/// analysis) that share cores with the threads that feed the audio callback.
++/// Needs no privileges. Deliberately not SCHED_IDLE: analyzers hold track
++/// cache / database locks the reader also takes, and SCHED_IDLE could leave a
++/// lock holder starved behind a busy thread (priority inversion).
++bool demoteCurrentThreadToBackground(const char* threadName);
++
++/// Pin the calling thread to the CPU number named by environment variable
++/// `envVar`, if it is set. Allocation-free, so it can run in the audio callback.
++bool pinCurrentThreadToCpuFromEnv(const char* envVar, const char* threadName);
++
++/// Lock process memory (mlockall, MCL_ONFAULT) so the audio callback never
++/// major-faults executable pages back in from the SD card under memory
++/// pressure. Only done when the memlock rlimit is unlimited (what the `audio`
++/// group's limits.d file grants) so it can never fail half-way or pin more
++/// than the user allowed. NAUTICMIXXX_MLOCK=0 disables it.
++bool lockAllMemoryIfPermitted();
++
++/// Promote the calling (GUI) thread when NAUTICMIXXX_RT_MAIN=1 is set. Off by
++/// default: a desktop compositor shares the machine, and a SCHED_FIFO GUI thread
++/// is only appropriate on a dedicated DJ unit. Also caps the global thread pool
++/// to SCHED_OTHER so pool threads do not inherit the RT policy.
++bool promoteMainThreadIfRequested();
++
++} // namespace mixxx

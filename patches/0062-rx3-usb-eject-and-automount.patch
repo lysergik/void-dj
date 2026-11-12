@@ -1,0 +1,974 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9320bc5..b106826 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2144,6 +2144,7 @@ if(BUILD_TESTING)
+     src/test/rekordboxruntimecatalog_test.cpp
+     src/test/rekordboxdatabase_test.cpp
+     src/test/rekordboxdevice_test.cpp
++    src/test/rx3automount_test.cpp
+     src/test/rx3display_test.cpp
+     src/test/rx3beatfx_test.cpp
+     src/test/soundreconfiguration_test.cpp
+diff --git a/src/coreservices.cpp b/src/coreservices.cpp
+index 2957571..f3b4395 100644
+--- a/src/coreservices.cpp
++++ b/src/coreservices.cpp
+@@ -45,6 +45,7 @@
+ #include "vinylcontrol/vinylcontrolmanager.h"
+ 
++#include "util/rx3automount.h"
+ #ifdef __APPLE__
+ #include "util/sandbox.h"
+ #endif
+ 
+@@ -445,6 +446,9 @@ void CoreServices::initializeLogging() {
+ }
+ 
+ void CoreServices::initialize(QApplication* pApp) {
++    // Mount unmounted non-system volumes in the background while the rest of
++    // Mixxx starts (patch 0062, Linux; NAUTICMIXXX_AUTOMOUNT=0 disables).
++    rx3::automount::Automount::instance().start();
+     VERIFY_OR_DEBUG_ASSERT(!m_isInitialized) {
+         return;
+     }
+@@ -879,6 +883,11 @@ void CoreServices::finalize() {
+ 
+     m_pControlIndicatorTimer.reset();
+ 
++    // Everything that could hold a file on a removable volume is closed now:
++    // unmount what the automount module mounted at start-up (patch 0062).
++    qDebug() << t.elapsed(false).debugMillisWithUnit() << "unmounting automounted volumes";
++    rx3::automount::Automount::instance().shutdown();
++
+     t.elapsed(true);
+ }
+ 
+diff --git a/src/library/rekordbox/rekordboxfeature.cpp b/src/library/rekordbox/rekordboxfeature.cpp
+index 3d758b5..a7792bd 100644
+--- a/src/library/rekordbox/rekordboxfeature.cpp
++++ b/src/library/rekordbox/rekordboxfeature.cpp
+@@ -226,6 +226,17 @@ void RekordboxFeature::activate() {
+     startDiscovery();
+ }
+ 
++void RekordboxFeature::releaseRoot(const QString& root) {
++    ++m_generations[root];
++    m_rekordboxSecurityTokens.remove(root);
++    if (const auto session = m_sessions.value(root)) {
++        session->invalidate();
++    }
++    if (m_loadingRoot == root && m_loadingSession) {
++        m_loadingSession->invalidate();
++    }
++}
++
+ void RekordboxFeature::checkMountedVolumes() {
+     QStringList roots;
+     for (const auto& volume : QStorageInfo::mountedVolumes()) {
+diff --git a/src/library/rekordbox/rekordboxfeature.h b/src/library/rekordbox/rekordboxfeature.h
+index 441d687..a2094c7 100644
+--- a/src/library/rekordbox/rekordboxfeature.h
++++ b/src/library/rekordbox/rekordboxfeature.h
+@@ -54,6 +54,10 @@ class RekordboxFeature final : public LibraryFeature {
+ 
+     mixxx::network::NetworkManager* networkManager() const { return m_pNetwork; }
+ 
++    // Stop using a volume that is about to be unmounted (EJECT): revoke its
++    // session and any load in flight so nothing keeps reading from it.
++    void releaseRoot(const QString& root);
++
+   public slots:
+     void activate() override;
+     void activateChild(const QModelIndex& index) override;
+diff --git a/src/test/rx3automount_test.cpp b/src/test/rx3automount_test.cpp
+new file mode 100644
+index 0000000..d3c4c9d
+--- /dev/null
++++ b/src/test/rx3automount_test.cpp
+@@ -0,0 +1,91 @@
++#include <gtest/gtest.h>
++
++#include "util/rx3automount.h"
++
++namespace {
++using namespace rx3::automount;
++
++// A DietPi-like board: SD card (boot + root) and two USB sticks.
++const char* kLsblk = R"({"blockdevices":[
++ {"name":"mmcblk0","path":"/dev/mmcblk0","type":"disk","fstype":null,"label":null,"uuid":null,"ro":false,"mountpoints":[null],
++  "children":[
++   {"name":"mmcblk0p1","path":"/dev/mmcblk0p1","type":"part","fstype":"vfat","label":"bootfs","uuid":"AAAA-0001","ro":false,"mountpoints":["/boot/firmware"]},
++   {"name":"mmcblk0p2","path":"/dev/mmcblk0p2","type":"part","fstype":"ext4","label":"rootfs","uuid":"u2","ro":false,"mountpoints":["/"]},
++   {"name":"mmcblk0p3","path":"/dev/mmcblk0p3","type":"part","fstype":"ext4","label":"spare","uuid":"u3","ro":false,"mountpoints":[null]}]},
++ {"name":"sda","path":"/dev/sda","type":"disk","fstype":null,"label":null,"uuid":null,"ro":false,"mountpoints":[null],
++  "children":[
++   {"name":"sda1","path":"/dev/sda1","type":"part","fstype":"exfat","label":"MUSIC 1","uuid":"1111-2222","ro":false,"mountpoints":[null]},
++   {"name":"sda2","path":"/dev/sda2","type":"part","fstype":"swap","label":null,"uuid":"s","ro":false,"mountpoints":[null]}]},
++ {"name":"sdb","path":"/dev/sdb","type":"disk","fstype":"vfat","label":"STICK","uuid":"3333-4444","ro":true,"mountpoints":[null]},
++ {"name":"sdc","path":"/dev/sdc","type":"disk","fstype":null,"label":null,"uuid":null,"ro":false,"mountpoints":[null],
++  "children":[{"name":"sdc1","path":"/dev/sdc1","type":"part","fstype":"ntfs","label":"DJ","uuid":"5555","ro":false,"mountpoints":["/media/DJ"]}]},
++ {"name":"zram0","path":"/dev/zram0","type":"disk","fstype":"swap","label":null,"uuid":null,"ro":false,"mountpoints":["[SWAP]"]},
++ {"name":"loop0","path":"/dev/loop0","type":"loop","fstype":"squashfs","label":null,"uuid":null,"ro":true,"mountpoints":[null]}
++]})";
++
++QStringList devices(const QList<Volume>& volumes) {
++    QStringList out;
++    for (const auto& v : volumes) out << v.device;
++    return out;
++}
++} // namespace
++
++TEST(Rx3Automount, NeverTouchesTheSystemDisk) {
++    const auto volumes = selectMountable(parseLsblk(kLsblk), {});
++    const auto list = devices(volumes);
++    // mmcblk0 carries / and /boot/firmware: even its unmounted spare partition stays alone.
++    EXPECT_FALSE(list.contains(QStringLiteral("/dev/mmcblk0p3")));
++    EXPECT_FALSE(list.contains(QStringLiteral("/dev/mmcblk0p1")));
++    EXPECT_FALSE(list.contains(QStringLiteral("/dev/mmcblk0p2")));
++}
++
++TEST(Rx3Automount, MountsOnlyUnmountedSupportedVolumes) {
++    const auto list = devices(selectMountable(parseLsblk(kLsblk), {}));
++    EXPECT_EQ((QStringList{QStringLiteral("/dev/sda1"), QStringLiteral("/dev/sdb")}), list);
++    // sda2 is swap, sdc1 is already mounted, loop/zram are ignored.
++}
++
++TEST(Rx3Automount, ReadOnlyFlagAndPartitionlessStickAreKept) {
++    const auto volumes = selectMountable(parseLsblk(kLsblk), {});
++    ASSERT_EQ(2, volumes.size());
++    EXPECT_FALSE(volumes[0].readOnly);
++    EXPECT_TRUE(volumes[1].readOnly);
++    EXPECT_EQ(QStringLiteral("vfat"), volumes[1].fstype);
++}
++
++TEST(Rx3Automount, DeviceBehindRootExcludesItsDiskEvenWithoutMountpoints) {
++    // Overlay/alias roots: findmnt reports the device, lsblk shows no mountpoint.
++    const char* json = R"({"blockdevices":[
++     {"name":"sda","path":"/dev/sda","type":"disk","mountpoints":[null],"children":[
++       {"name":"sda1","path":"/dev/sda1","type":"part","fstype":"ext4","mountpoints":[null]},
++       {"name":"sda2","path":"/dev/sda2","type":"part","fstype":"ext4","mountpoints":[null]}]}]})";
++    EXPECT_FALSE(selectMountable(parseLsblk(json), {}).isEmpty()); // without the hint it would mount
++    EXPECT_TRUE(selectMountable(parseLsblk(json), {QStringLiteral("/dev/sda2")}).isEmpty());
++}
++
++TEST(Rx3Automount, DietPiUserDataAndOverlayrootCountAsSystem) {
++    EXPECT_TRUE(isSystemMountpoint(QStringLiteral("/mnt/dietpi_userdata")));
++    EXPECT_TRUE(isSystemMountpoint(QStringLiteral("/mnt/dietpi_userdata/music")));
++    EXPECT_TRUE(isSystemMountpoint(QStringLiteral("/media/root-ro")));
++    EXPECT_TRUE(isSystemMountpoint(QStringLiteral("[SWAP]")));
++    EXPECT_FALSE(isSystemMountpoint(QStringLiteral("/media/DJ")));
++    EXPECT_FALSE(isSystemMountpoint(QStringLiteral("/mnt/dietpi_userdata2")));
++}
++
++TEST(Rx3Automount, MountNamesAreSafeAndUnique) {
++    EXPECT_EQ(QStringLiteral("MUSIC_1"), mountName({QStringLiteral("/dev/sda1"), {}, QStringLiteral("MUSIC 1"), {}}));
++    EXPECT_EQ(QStringLiteral("1111-2222"), mountName({QStringLiteral("/dev/sda1"), {}, QString(), QStringLiteral("1111-2222")}));
++    EXPECT_EQ(QStringLiteral("sda1"), mountName({QStringLiteral("/dev/sda1"), {}, QString(), QString()}));
++    // a label can never climb out of /media: separators become underscores
++    EXPECT_EQ(QStringLiteral("_.._etc"), mountName({QStringLiteral("/dev/x"), {}, QStringLiteral("../../etc"), {}}));
++    EXPECT_EQ(QStringLiteral("/media/DJ-3"),
++            uniqueMountpoint(QStringLiteral("/media"), QStringLiteral("DJ"),
++                    {QStringLiteral("/media/DJ"), QStringLiteral("/media/DJ-2")}));
++}
++
++TEST(Rx3Automount, MountOptionsGiveTheUserWriteAccessOnFatLikeFilesystems) {
++    EXPECT_TRUE(mountOptions(QStringLiteral("vfat"), false, 1000, 1000).contains(QStringLiteral("uid=1000,gid=1000")));
++    EXPECT_TRUE(mountOptions(QStringLiteral("exfat"), false, 1000, 1000).contains(QStringLiteral("umask=0022")));
++    EXPECT_FALSE(mountOptions(QStringLiteral("ext4"), false, 1000, 1000).contains(QStringLiteral("uid=")));
++    EXPECT_TRUE(mountOptions(QStringLiteral("ext4"), true, 0, 0).startsWith(QStringLiteral("ro,nosuid,nodev,noexec")));
++}
+diff --git a/src/util/rx3automount.h b/src/util/rx3automount.h
+new file mode 100644
+index 0000000..3e6968e
+--- /dev/null
++++ b/src/util/rx3automount.h
+@@ -0,0 +1,669 @@
++#pragma once
++
++// NauticMixxx automount / eject (patch 0062).
++//
++// At start-up (Linux only) a worker thread lists the block devices with
++// lsblk, leaves every disk that carries the running system alone (anything
++// mounted at /, /boot, /boot/firmware, /boot/efi, /usr, /var, /home, swap,
++// the DietPi user-data mount, or the device behind `findmnt /`) and mounts
++// the remaining *unmounted* volumes under /media/<label>, where the USB
++// discovery of RekordboxFeature already looks. At shutdown the volumes this
++// module mounted are unmounted again. eject() unmounts one volume on demand
++// (the EJECT button of the SOURCE page).
++//
++// Only tools of a stock DietPi / Debian install are used: lsblk, findmnt,
++// mount, umount, sync, mkdir, rmdir (util-linux and coreutils), plus sudo
++// when Mixxx does not run as root. udisksctl power-off is tried after an
++// eject only if it happens to be installed.
++//
++// Opt out with NAUTICMIXXX_AUTOMOUNT=0. Everything is best effort: a failure
++// is logged and never blocks start-up or shutdown.
++
++#include <QByteArray>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QList>
++#include <QMutex>
++#include <QMutexLocker>
++#include <QProcess>
++#include <QRegularExpression>
++#include <QSet>
++#include <QStandardPaths>
++#include <QStorageInfo>
++#include <QString>
++#include <QStringList>
++#include <QThread>
++#include <QtDebug>
++#include <algorithm>
++#include <memory>
++#include <utility>
++
++#ifdef __LINUX__
++#include <unistd.h>
++#endif
++
++namespace rx3::automount {
++
++// ---------------------------------------------------------------- selection
++// Pure logic (no process, no filesystem access): unit tested.
++
++struct Node {
++    QString name;
++    QString path;
++    QString type; // disk, part, ...
++    QString fstype;
++    QString label;
++    QString uuid;
++    QStringList mountpoints;
++    bool readOnly = false;
++    QList<Node> children;
++};
++
++struct Volume {
++    QString device;
++    QString fstype;
++    QString label;
++    QString uuid;
++    bool readOnly = false;
++};
++
++inline QStringList systemMountpoints() {
++    return {QStringLiteral("/"),
++            QStringLiteral("/boot"),
++            QStringLiteral("/boot/firmware"),
++            QStringLiteral("/boot/efi"),
++            QStringLiteral("/usr"),
++            QStringLiteral("/var"),
++            QStringLiteral("/home"),
++            QStringLiteral("/opt"),
++            QStringLiteral("/tmp")};
++}
++
++inline bool isSystemMountpoint(const QString& mountpoint) {
++    if (mountpoint == QLatin1String("[SWAP]")) {
++        return true;
++    }
++    const QString clean = QDir::cleanPath(mountpoint);
++    if (systemMountpoints().contains(clean)) {
++        return true;
++    }
++    // DietPi user data drive, overlayroot (read-only root) lower/upper layers.
++    for (const char* prefix : {"/mnt/dietpi_userdata", "/media/root-ro", "/media/root-rw"}) {
++        const QString p = QString::fromLatin1(prefix);
++        if (clean == p || clean.startsWith(p + QLatin1Char('/'))) {
++            return true;
++        }
++    }
++    return false;
++}
++
++inline bool supportedFilesystem(const QString& fstype) {
++    static const QSet<QString> kSupported = {
++            QStringLiteral("vfat"),
++            QStringLiteral("exfat"),
++            QStringLiteral("ntfs"),
++            QStringLiteral("ntfs3"),
++            QStringLiteral("ext2"),
++            QStringLiteral("ext3"),
++            QStringLiteral("ext4"),
++            QStringLiteral("xfs"),
++            QStringLiteral("btrfs"),
++            QStringLiteral("hfsplus"),
++    };
++    return kSupported.contains(fstype.toLower());
++}
++
++inline void collectMountpoints(const Node& node, QStringList* out) {
++    out->append(node.mountpoints);
++    for (const auto& child : node.children) {
++        collectMountpoints(child, out);
++    }
++}
++
++inline bool containsDevice(const Node& node, const QSet<QString>& devices) {
++    if (!node.path.isEmpty() && devices.contains(node.path)) {
++        return true;
++    }
++    for (const auto& child : node.children) {
++        if (containsDevice(child, devices)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// A disk is "system" when any of its volumes (or nested device-mapper
++// children) is mounted on a system path, or is the device behind / or /boot.
++inline bool isSystemDisk(const Node& disk, const QSet<QString>& systemDevices) {
++    QStringList mounts;
++    collectMountpoints(disk, &mounts);
++    for (const auto& mountpoint : std::as_const(mounts)) {
++        if (isSystemMountpoint(mountpoint)) {
++            return true;
++        }
++    }
++    return containsDevice(disk, systemDevices);
++}
++
++inline bool ignoredDiskName(const QString& name) {
++    static const QRegularExpression re(QStringLiteral("^(loop|ram|zram|nbd|sr|fd|md|dm-|mtdblock)"));
++    return re.match(name).hasMatch();
++}
++
++// Volumes that are safe and useful to mount: unmounted, supported filesystem,
++// on a disk that does not carry the running system.
++inline QList<Volume> selectMountable(
++        const QList<Node>& disks, const QSet<QString>& systemDevices) {
++    QList<Volume> out;
++    const auto consider = [&out](const Node& node) {
++        if (!node.mountpoints.isEmpty() || !supportedFilesystem(node.fstype)) {
++            return;
++        }
++        out.append({node.path, node.fstype.toLower(), node.label, node.uuid, node.readOnly});
++    };
++    for (const auto& disk : disks) {
++        if (disk.type != QLatin1String("disk") || ignoredDiskName(disk.name)) {
++            continue;
++        }
++        if (isSystemDisk(disk, systemDevices)) {
++            continue;
++        }
++        if (disk.children.isEmpty()) {
++            consider(disk); // partition-less ("superfloppy") stick
++            continue;
++        }
++        for (const auto& child : disk.children) {
++            if (child.type == QLatin1String("part")) {
++                consider(child);
++            }
++        }
++    }
++    return out;
++}
++
++inline Node parseNode(const QJsonObject& object) {
++    Node node;
++    node.name = object.value(QLatin1String("name")).toString();
++    node.path = object.value(QLatin1String("path")).toString();
++    node.type = object.value(QLatin1String("type")).toString();
++    node.fstype = object.value(QLatin1String("fstype")).toString();
++    node.label = object.value(QLatin1String("label")).toString();
++    node.uuid = object.value(QLatin1String("uuid")).toString();
++    const auto ro = object.value(QLatin1String("ro"));
++    node.readOnly = ro.isBool() ? ro.toBool() : (ro.toString() == QLatin1String("1") || ro.toInt() == 1);
++    const auto mountpoints = object.value(QLatin1String("mountpoints"));
++    if (mountpoints.isArray()) {
++        for (const auto& value : mountpoints.toArray()) {
++            if (value.isString() && !value.toString().isEmpty()) {
++                node.mountpoints.append(value.toString());
++            }
++        }
++    }
++    const auto mountpoint = object.value(QLatin1String("mountpoint")); // older lsblk
++    if (mountpoint.isString() && !mountpoint.toString().isEmpty()) {
++        node.mountpoints.append(mountpoint.toString());
++    }
++    for (const auto& child : object.value(QLatin1String("children")).toArray()) {
++        node.children.append(parseNode(child.toObject()));
++    }
++    return node;
++}
++
++inline QList<Node> parseLsblk(const QByteArray& json) {
++    QList<Node> disks;
++    const auto document = QJsonDocument::fromJson(json);
++    for (const auto& value : document.object().value(QLatin1String("blockdevices")).toArray()) {
++        disks.append(parseNode(value.toObject()));
++    }
++    return disks;
++}
++
++// Directory name below /media for a volume: its label (or UUID, or the device
++// name), restricted to characters that are safe in a path and in fstab-less
++// mount calls.
++inline QString mountName(const Volume& volume) {
++    QString name = !volume.label.trimmed().isEmpty() ? volume.label
++            : !volume.uuid.isEmpty()                 ? volume.uuid
++                                                     : QFileInfo(volume.device).fileName();
++    name.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._-]+")), QStringLiteral("_"));
++    name = name.left(48);
++    while (name.startsWith(QLatin1Char('.'))) {
++        name.remove(0, 1);
++    }
++    return name.isEmpty() ? QStringLiteral("usb") : name;
++}
++
++inline QString uniqueMountpoint(const QString& base, const QString& name, const QSet<QString>& taken) {
++    QString candidate = base + QLatin1Char('/') + name;
++    for (int n = 2; taken.contains(candidate); ++n) {
++        candidate = base + QLatin1Char('/') + name + QLatin1Char('-') + QString::number(n);
++    }
++    return candidate;
++}
++
++// Mount options for a filesystem. uid/gid make FAT/exFAT/NTFS volumes writable
++// by the user running Mixxx (the rekordbox export, ratings and MY SETTINGS are
++// written back to the stick); ext*/xfs/btrfs keep their own ownership.
++inline QString mountOptions(const QString& fstype, bool readOnly, uint uid, uint gid) {
++    QStringList options{readOnly ? QStringLiteral("ro") : QStringLiteral("rw"),
++            QStringLiteral("nosuid"),
++            QStringLiteral("nodev"),
++            QStringLiteral("noexec"),
++            QStringLiteral("noatime")};
++    const QString owner = QStringLiteral("uid=%1,gid=%2,umask=0022").arg(uid).arg(gid);
++    if (fstype == QLatin1String("vfat")) {
++        options << owner << QStringLiteral("iocharset=utf8") << QStringLiteral("flush");
++    } else if (fstype == QLatin1String("exfat") || fstype == QLatin1String("ntfs") ||
++            fstype == QLatin1String("ntfs3")) {
++        options << owner;
++    }
++    return options.join(QLatin1Char(','));
++}
++
++// ------------------------------------------------------------------ runtime
++#ifdef __LINUX__
++
++struct RunResult {
++    bool started = false;
++    int exitCode = -1;
++    QString out;
++    QString err;
++    bool ok() const { return started && exitCode == 0; }
++};
++
++inline QString tool(const QString& name) {
++    static const QStringList kDirs = {QStringLiteral("/usr/bin"),
++            QStringLiteral("/bin"),
++            QStringLiteral("/usr/sbin"),
++            QStringLiteral("/sbin"),
++            QStringLiteral("/usr/local/bin")};
++    QString found = QStandardPaths::findExecutable(name);
++    if (found.isEmpty()) {
++        found = QStandardPaths::findExecutable(name, kDirs);
++    }
++    return found;
++}
++
++inline RunResult run(const QString& program,
++        const QStringList& args,
++        bool privileged,
++        int timeoutMs = 30000) {
++    RunResult result;
++    QString exe = tool(program);
++    if (exe.isEmpty()) {
++        result.err = QStringLiteral("%1 not found").arg(program);
++        return result;
++    }
++    QStringList full = args;
++    if (privileged && ::geteuid() != 0) {
++        const QString sudo = tool(QStringLiteral("sudo"));
++        if (!sudo.isEmpty()) {
++            full.prepend(exe);
++            full.prepend(QStringLiteral("-n")); // never wait for a password
++            exe = sudo;
++        }
++    }
++    QProcess process;
++    process.setProcessChannelMode(QProcess::SeparateChannels);
++    // Keep messages parseable regardless of the user's locale.
++    auto environment = QProcessEnvironment::systemEnvironment();
++    environment.insert(QStringLiteral("LC_ALL"), QStringLiteral("C"));
++    process.setProcessEnvironment(environment);
++    process.start(exe, full);
++    if (!process.waitForStarted(5000)) {
++        result.err = process.errorString();
++        return result;
++    }
++    result.started = true;
++    if (!process.waitForFinished(timeoutMs)) {
++        process.kill();
++        process.waitForFinished(2000);
++        result.err = QStringLiteral("timeout");
++        return result;
++    }
++    result.exitCode = process.exitStatus() == QProcess::NormalExit ? process.exitCode() : -1;
++    result.out = QString::fromLocal8Bit(process.readAllStandardOutput());
++    result.err = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
++    return result;
++}
++
++inline QSet<QString> mountedRoots() {
++    QSet<QString> roots;
++    for (const auto& volume : QStorageInfo::mountedVolumes()) {
++        roots.insert(QDir::cleanPath(volume.rootPath()));
++    }
++    return roots;
++}
++
++inline QSet<QString> availableFilesystems() {
++    QSet<QString> out;
++    QFile file(QStringLiteral("/proc/filesystems"));
++    if (file.open(QIODevice::ReadOnly)) {
++        for (const auto& line : QString::fromLocal8Bit(file.readAll()).split(QLatin1Char('\n'))) {
++            const auto parts = line.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
++            if (!parts.isEmpty()) {
++                out.insert(parts.last());
++            }
++        }
++    }
++    return out;
++}
++
++// Devices behind / and the boot directories, from findmnt (covers an overlay
++// or /dev/root alias that lsblk does not show as a mountpoint).
++inline QSet<QString> systemDevices() {
++    QSet<QString> devices;
++    for (const char* target : {"/", "/boot", "/boot/firmware", "/boot/efi", "/usr", "/var", "/home"}) {
++        const auto result = run(QStringLiteral("findmnt"),
++                {QStringLiteral("-n"), QStringLiteral("-o"), QStringLiteral("SOURCE"), QString::fromLatin1(target)},
++                false,
++                5000);
++        if (!result.ok()) {
++            continue;
++        }
++        QString source = result.out.trimmed();
++        source.remove(QRegularExpression(QStringLiteral("\\[.*\\]$"))); // btrfs subvolume suffix
++        if (source.startsWith(QLatin1String("/dev/"))) {
++            devices.insert(source);
++            const auto canonical = QFileInfo(source).canonicalFilePath();
++            if (!canonical.isEmpty()) {
++                devices.insert(canonical);
++            }
++        }
++    }
++    return devices;
++}
++
++inline QList<Node> listBlockDevices() {
++    const QString columns =
++            QStringLiteral("NAME,PATH,TYPE,FSTYPE,LABEL,UUID,RO,%1");
++    for (const auto& mountColumn : {QStringLiteral("MOUNTPOINTS"), QStringLiteral("MOUNTPOINT")}) {
++        const auto result = run(QStringLiteral("lsblk"),
++                {QStringLiteral("-J"), QStringLiteral("-o"), columns.arg(mountColumn)},
++                false,
++                10000);
++        if (result.ok()) {
++            return parseLsblk(result.out.toUtf8());
++        }
++    }
++    return {};
++}
++
++class Automount {
++  public:
++    struct Mounted {
++        QString device;
++        QString mountpoint;
++        bool createdDirectory = false;
++    };
++
++    static Automount& instance() {
++        static Automount automount;
++        return automount;
++    }
++
++    static bool enabled() {
++        const auto value = qEnvironmentVariable("NAUTICMIXXX_AUTOMOUNT").trimmed().toLower();
++        return !(value == QLatin1String("0") || value == QLatin1String("off") ||
++                value == QLatin1String("false") || value == QLatin1String("no"));
++    }
++
++    // Scan and mount on a worker thread; returns immediately.
++    void start() {
++        QMutexLocker locker(&m_mutex);
++        if (m_thread || !enabled()) {
++            return;
++        }
++        m_thread = QThread::create([this] { scanAndMount(); });
++        m_thread->setObjectName(QStringLiteral("RX3Automount"));
++        m_thread->start(QThread::LowPriority);
++    }
++
++    // Blocks until the scan has finished, then unmounts what it mounted.
++    void shutdown() {
++        QThread* thread = nullptr;
++        {
++            QMutexLocker locker(&m_mutex);
++            thread = std::exchange(m_thread, nullptr);
++        }
++        if (thread) {
++            thread->wait(60000);
++            delete thread;
++        }
++        QList<Mounted> mounted;
++        {
++            QMutexLocker locker(&m_mutex);
++            mounted = std::exchange(m_mounted, {});
++        }
++        if (mounted.isEmpty()) {
++            return;
++        }
++        run(QStringLiteral("sync"), {}, false, 60000);
++        for (auto it = mounted.rbegin(); it != mounted.rend(); ++it) {
++            const auto error = unmount(it->mountpoint);
++            if (error.isEmpty()) {
++                qInfo() << "Automount: unmounted" << it->mountpoint;
++                if (it->createdDirectory) {
++                    run(QStringLiteral("rmdir"), {it->mountpoint}, true, 5000);
++                }
++            } else {
++                qWarning() << "Automount: could not unmount" << it->mountpoint << error;
++            }
++        }
++    }
++
++    // Unmounts the volume mounted at `root` (any volume, not only ours).
++    // Returns an empty string on success, otherwise a short UPPERCASE reason
++    // for the touchscreen. `note` receives an extra hint (e.g. power-off).
++    QString eject(const QString& root, QString* note = nullptr) {
++        const QString clean = QDir::cleanPath(QFileInfo(root).canonicalFilePath());
++        if (clean.isEmpty()) {
++            return QStringLiteral("DEVICE IS NOT MOUNTED");
++        }
++        QStorageInfo info(clean);
++        if (!info.isValid() || QDir::cleanPath(info.rootPath()) != clean) {
++            return QStringLiteral("NOT A SEPARATE VOLUME");
++        }
++        if (isSystemMountpoint(clean)) {
++            return QStringLiteral("SYSTEM VOLUME — NOT EJECTED");
++        }
++        const QString device = QString::fromLocal8Bit(info.device());
++        run(QStringLiteral("sync"), {}, false, 60000);
++        const auto error = unmount(clean);
++        if (!error.isEmpty()) {
++            return error;
++        }
++        bool created = false;
++        {
++            QMutexLocker locker(&m_mutex);
++            for (int i = 0; i < m_mounted.size(); ++i) {
++                if (m_mounted[i].mountpoint == clean) {
++                    created = m_mounted[i].createdDirectory;
++                    m_mounted.removeAt(i);
++                    break;
++                }
++            }
++        }
++        if (created) {
++            run(QStringLiteral("rmdir"), {clean}, true, 5000);
++        }
++        powerOffIfIdle(device, note);
++        qInfo() << "Automount: ejected" << clean << device;
++        return {};
++    }
++
++    QList<Mounted> mounted() const {
++        QMutexLocker locker(&m_mutex);
++        return m_mounted;
++    }
++
++  private:
++    Automount() = default;
++
++    // umount with a few retries: a decoder or the USB session may still be
++    // closing a file for a moment after it was released.
++    static QString unmount(const QString& mountpoint) {
++        QString lastError;
++        for (int attempt = 0; attempt < 6; ++attempt) {
++            if (attempt) {
++                QThread::msleep(500);
++            }
++            const auto result = run(QStringLiteral("umount"), {mountpoint}, true, 60000);
++            if (result.ok()) {
++                return {};
++            }
++            lastError = result.err;
++            if (!lastError.contains(QLatin1String("busy"), Qt::CaseInsensitive)) {
++                break;
++            }
++        }
++        if (lastError.contains(QLatin1String("busy"), Qt::CaseInsensitive)) {
++            return QStringLiteral("DEVICE BUSY — STOP THE DECKS USING IT");
++        }
++        if (lastError.contains(QLatin1String("not mounted"), Qt::CaseInsensitive)) {
++            return {};
++        }
++        if (lastError.contains(QLatin1String("password"), Qt::CaseInsensitive) ||
++                lastError.contains(QLatin1String("permission"), Qt::CaseInsensitive) ||
++                lastError.contains(QLatin1String("not permitted"), Qt::CaseInsensitive) ||
++                lastError.contains(QLatin1String("sudo"), Qt::CaseInsensitive)) {
++            return QStringLiteral("NO PERMISSION TO UNMOUNT (ROOT OR SUDO NEEDED)");
++        }
++        qWarning() << "Automount: umount failed:" << lastError;
++        return QStringLiteral("UNMOUNT FAILED");
++    }
++
++    // After the last partition of a disk is unmounted, ask udisks to power the
++    // port down when it is installed (not part of stock DietPi).
++    static void powerOffIfIdle(const QString& device, QString* note) {
++        if (device.isEmpty() || tool(QStringLiteral("udisksctl")).isEmpty()) {
++            return;
++        }
++        const auto parent = run(QStringLiteral("lsblk"),
++                {QStringLiteral("-n"), QStringLiteral("-o"), QStringLiteral("PKNAME"), device},
++                false,
++                5000);
++        const QString disk = parent.out.trimmed().split(QLatin1Char('\n')).value(0).trimmed();
++        if (disk.isEmpty()) {
++            return;
++        }
++        const auto mounts = run(QStringLiteral("lsblk"),
++                {QStringLiteral("-n"), QStringLiteral("-r"), QStringLiteral("-o"),
++                        QStringLiteral("MOUNTPOINT"), QStringLiteral("/dev/") + disk},
++                false,
++                5000);
++        if (!mounts.ok() || !mounts.out.trimmed().isEmpty()) {
++            return; // another partition of that disk is still in use
++        }
++        if (run(QStringLiteral("udisksctl"),
++                    {QStringLiteral("power-off"), QStringLiteral("-b"), QStringLiteral("/dev/") + disk},
++                    false,
++                    10000)
++                        .ok() &&
++                note) {
++            *note = QStringLiteral("POWERED OFF");
++        }
++    }
++
++    void scanAndMount() {
++        const auto disks = listBlockDevices();
++        if (disks.isEmpty()) {
++            qInfo() << "Automount: lsblk returned nothing, skipping";
++            return;
++        }
++        const auto volumes = selectMountable(disks, systemDevices());
++        if (volumes.isEmpty()) {
++            return;
++        }
++        const auto kernelFilesystems = availableFilesystems();
++        QSet<QString> taken = mountedRoots();
++        const QString base = QStringLiteral("/media");
++        const uint uid = ::geteuid();
++        const uint gid = ::getegid();
++        for (const auto& volume : volumes) {
++            const QString mountpoint = uniqueMountpoint(base, mountName(volume), occupied(base, taken));
++            QString type = volume.fstype;
++            if (type == QLatin1String("ntfs")) {
++                type = kernelFilesystems.contains(QStringLiteral("ntfs3")) ? QStringLiteral("ntfs3")
++                        : !tool(QStringLiteral("mount.ntfs-3g")).isEmpty() ? QStringLiteral("ntfs-3g")
++                                                                          : QStringLiteral("ntfs");
++            }
++            const bool existed = QFileInfo::exists(mountpoint);
++            if (!existed && !run(QStringLiteral("mkdir"), {QStringLiteral("-p"), mountpoint}, true, 5000).ok()) {
++                qWarning() << "Automount: cannot create" << mountpoint;
++                continue;
++            }
++            bool ok = false;
++            for (const bool readOnly : {volume.readOnly, true}) {
++                const auto result = run(QStringLiteral("mount"),
++                        {QStringLiteral("-t"), type, QStringLiteral("-o"),
++                                mountOptions(volume.fstype, readOnly, uid, gid), volume.device, mountpoint},
++                        true,
++                        60000);
++                if (result.ok()) {
++                    qInfo() << "Automount:" << volume.device << "->" << mountpoint
++                            << (readOnly ? "(read-only)" : "");
++                    ok = true;
++                    break;
++                }
++                qWarning() << "Automount: mount failed for" << volume.device << result.err;
++                if (readOnly) {
++                    break; // the second round already was the read-only retry
++                }
++            }
++            if (ok) {
++                taken.insert(mountpoint);
++                QMutexLocker locker(&m_mutex);
++                m_mounted.append({volume.device, mountpoint, !existed});
++            } else if (!existed) {
++                run(QStringLiteral("rmdir"), {mountpoint}, true, 5000);
++            }
++        }
++    }
++
++    // Names below `base` that must not be reused: mounted roots plus any
++    // non-empty directory that is not a mount point.
++    static QSet<QString> occupied(const QString& base, QSet<QString> taken) {
++        for (const auto& entry : QDir(base).entryInfoList(QDir::AllDirs | QDir::NoDotAndDotDot)) {
++            if (!QDir(entry.absoluteFilePath()).isEmpty()) {
++                taken.insert(entry.absoluteFilePath());
++            }
++        }
++        return taken;
++    }
++
++    mutable QMutex m_mutex;
++    QThread* m_thread = nullptr;
++    QList<Mounted> m_mounted;
++};
++
++#else // !__LINUX__
++
++class Automount {
++  public:
++    static Automount& instance() {
++        static Automount automount;
++        return automount;
++    }
++    static bool enabled() { return false; }
++    void start() {}
++    void shutdown() {}
++    QString eject(const QString&, QString* = nullptr) {
++        return QStringLiteral("EJECT IS NOT AVAILABLE ON THIS SYSTEM");
++    }
++};
++
++#endif // __LINUX__
++
++inline constexpr bool kEjectSupported =
++#ifdef __LINUX__
++        true;
++#else
++        false;
++#endif
++
++} // namespace rx3::automount
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index 389a636..3370f34 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -57,6 +57,9 @@
+ #include "widget/wrx3shortcut.h"
+ #include "widget/rx3sourceappearance.h"
+ #include "mixer/playerinfo.h"
++#include "util/rx3automount.h"
++#include <QFutureWatcher>
++#include <QtConcurrentRun>
+ 
+ class Rx3CategoryDelegate : public QStyledItemDelegate {
+   public:
+@@ -281,8 +284,16 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_sourceMenu->findChild<QLabel*>("RX3ToolsStatus")->setFixedHeight(rx3ui::S(64));
+         m_sourceMenu->setStyleSheet(rx3ui::qss(QString("#RX3BrowserTools {background:#202020;color:white;} #RX3BrowserTools QLabel {color:white;font-family:Arial;font-size:16px;} #RX3BrowserTools QListWidget {background:#202020;color:white;border:1px solid #aaa;font-family:Arial;font-size:19px;} #RX3BrowserTools QPushButton {background:#202020;color:white;border:1px solid #aaa;min-height:36px;} #RX3SourceSettingsBack[encoderFocus=\"true\"] {background:#007CE0;}")));
+         m_sourceSettings=new QPushButton("MY SETTINGS MENU",sourceInfoPanel);m_sourceSettings->setObjectName("RX3SourceSettings");
+-        sourceInfoLayout->addWidget(m_sourceSettings);sourceInfoLayout->addStretch(1);
++        sourceInfoLayout->addWidget(m_sourceSettings);
++        // EJECT (patch 0062): unmounts the selected USB source so it can be unplugged.
++        m_eject=new QPushButton("EJECT",sourceInfoPanel);m_eject->setObjectName("RX3SourceEject");
++        m_eject->setEnabled(false);m_eject->setVisible(rx3::automount::kEjectSupported);
++        m_ejectStatus=new QLabel(sourceInfoPanel);m_ejectStatus->setObjectName("RX3SourceEjectStatus");
++        m_ejectStatus->setWordWrap(true);m_ejectStatus->hide();
++        sourceInfoLayout->addSpacing(rx3ui::S(8));sourceInfoLayout->addWidget(m_eject);sourceInfoLayout->addWidget(m_ejectStatus);
++        sourceInfoLayout->addStretch(1);
+         connect(m_sourceSettings,&QPushButton::clicked,this,[this]{openSourceSettings();});
++        connect(m_eject,&QPushButton::clicked,this,[this]{ejectSelectedSource();});
+         sl->addWidget(sourceInfoPanel, 2); m_pages->addWidget(sourcePage);
+         m_tools=new WRx3ToolMenu(m_pages);m_pages->addWidget(m_tools);
+         m_utility=new WRx3Utility(m_pages);m_pages->addWidget(m_utility);
+@@ -340,6 +351,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         makeControl("tag_list",[this](double value){if(value>0) openSourceSection("TAG LIST");});
+         makeControl("playlist",[this](double value){if(value>0) openSourceSection("PLAYLIST");});
+         makeControl("search",[this](double value){if(value>0 && prepareSourceNavigation()) openSearch();});
++        makeControl("usb_eject",[this](double value){if(value>0) {showBrowser();showSources();ejectSelectedSource();}});
+         makeControl("my_settings",[this](double value){if(value>0) {showBrowser();showSources();openSourceSettings();}});
+         for(const auto& name:{"play_mode","eject_lock"}) {
+             const auto key=ConfigKey("[RX3Settings]",name);
+@@ -1073,6 +1085,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         }
+     }
+     void showSources() {
++        if(m_ejectStatus && !m_ejecting) m_ejectStatus->hide();
+         if(m_detailedInfo->isVisible()) ControlObject::set(ConfigKey("[RX3Info]","visible"),0);
+         m_keyboard->hide();m_search->hide();m_categories->show();m_searchRail->hide();m_breadcrumb->show();m_searchCount->hide();
+         m_source->setText("SOURCE");
+@@ -1370,6 +1383,51 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_refreshingSources=false;
+         updateSourceInfo(selected);
+     }
++    // Deck (1-4) that has a track from `root` loaded, or 0.
++    int deckUsingRoot(const QString& root) const {
++        const QString prefix=QDir::cleanPath(root)+QLatin1Char('/');
++        for(int deck=1;deck<=4;++deck) {
++            const auto track=PlayerInfo::instance().getTrackInfo(QString("[Channel%1]").arg(deck));
++            if(track && track->getLocation().startsWith(prefix)) return deck;
++        }
++        return 0;
++    }
++    void showEjectStatus(const QString& text,bool error) {
++        m_ejectStatus->setText(text);
++        m_ejectStatus->setStyleSheet(rx3ui::qss(QString("color:%1;font-size:16px;padding:6px;").arg(error?"#ff6b6b":"#7ddc7d")));
++        m_ejectStatus->show();
++    }
++    void ejectSelectedSource() {
++        if(m_ejecting || m_pages->currentIndex()!=1 || !rx3::automount::kEjectSupported) return;
++        const int row=m_sources->indexOfTopLevelItem(m_sources->currentItem());
++        if(row<0 || row>=int(m_devices.size())) {showEjectStatus("SELECT A USB DEVICE FIRST",true);return;}
++        const QString root=deviceRoot(m_devices[row]);
++        const QString slot=m_sources->topLevelItem(row)->data(0,Qt::UserRole+2).toString();
++        if(const int deck=deckUsingRoot(root)) {
++            showEjectStatus(QString("DECK %1 HAS A TRACK FROM %2 — EJECT THAT TRACK FIRST").arg(deck).arg(slot),true);
++            return;
++        }
++        if(m_selectedDevice.isValid() && deviceRoot(m_selectedDevice)==root) {
++            m_selectedDevice=QPersistentModelIndex();m_currentRoot.clear();
++        }
++        // Stop every read from the stick, then unmount off the GUI thread.
++        if(auto* feature=m_backend->rekordboxFeature()) feature->releaseRoot(root);
++        m_ejecting=true;m_eject->setEnabled(false);showEjectStatus(QString("EJECTING %1…").arg(slot),false);
++        auto* watcher=new QFutureWatcher<QPair<QString,QString>>(this);
++        connect(watcher,&QFutureWatcher<QPair<QString,QString>>::finished,this,[this,watcher,slot]{
++            const auto result=watcher->result();watcher->deleteLater();
++            m_ejecting=false;
++            if(result.first.isEmpty()) showEjectStatus(QString("%1 EJECTED — SAFE TO REMOVE").arg(slot)+
++                    (result.second.isEmpty()?QString():QString(" (%1)").arg(result.second)),false);
++            else showEjectStatus(result.first,true);
++            refreshSources();
++        });
++        watcher->setFuture(QtConcurrent::run([root]{
++            QString note;
++            const QString error=rx3::automount::Automount::instance().eject(root,&note);
++            return QPair<QString,QString>(error,note);
++        }));
++    }
+     void updateSourceInfo(int row) {
+         if(!m_settingsRoot.isEmpty() && (row<0 || row>=int(m_devices.size()) ||
+                 deviceRoot(m_devices[row])!=m_settingsRoot || !deviceReady(m_devices[row]))) closeSourceSettings();
+@@ -1386,6 +1444,8 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         const bool mixman=ready && isMixmanRoot(deviceRoot(m_devices[row]));
+         m_sourceSettings->setText(mixman?"IMPORT TO STORAGE":"MY SETTINGS MENU");
+         m_sourceSettings->setEnabled(ready);
++        // Any listed USB source can be ejected (also one that is still READING or in ERROR).
++        m_eject->setEnabled(hasDevice && !m_ejecting && rx3::automount::kEjectSupported);
+         for(int i=1;i<=4;++i) m_headerButtons[i]->setEnabled(ready || isStorageRow(row) ||
+                 (m_pages->currentIndex()!=1 && (m_storageMode || deviceReady(m_selectedDevice))));
+         if(hasDevice) {
+@@ -1931,6 +1991,9 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     WLibrarySidebar* m_sidebar;
+     QPushButton* m_source;
+     QPushButton* m_sourceSettings;
++    QPushButton* m_eject=nullptr;
++    QLabel* m_ejectStatus=nullptr;
++    bool m_ejecting=false;
+     QLabel* m_sourceLabel;
+     QWidget* m_headerWidget;
+     QStackedWidget* m_sourceDetails;

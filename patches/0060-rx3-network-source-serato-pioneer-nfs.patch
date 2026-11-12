@@ -1,0 +1,2482 @@
+diff --git a/src/library/mixman/mixmanstick.h b/src/library/mixman/mixmanstick.h
+index 48bb669..16bc4a7 100644
+--- a/src/library/mixman/mixmanstick.h
++++ b/src/library/mixman/mixmanstick.h
+@@ -21,6 +21,7 @@
+ #include <QSqlQuery>
+ #include <QSqlRecord>
+ #include <QString>
++#include <QTemporaryDir>
+ #include <QUuid>
+ #include <QVariant>
+ 
+@@ -146,18 +147,13 @@ inline bool tableExists(QSqlDatabase& db, const QString& name) {
+ } // namespace detail
+ 
+ // Read the whole export. `error` is set on failure. Safe to call from a worker thread.
+-inline bool read(const QString& root, Stick* stick, QString* error) {
+-    const QString path = databasePath(root);
+-    if (path.isEmpty()) {
+-        if (error) *error = QStringLiteral("No MIXMAN export found");
+-        return false;
+-    }
++inline bool readDatabase(const QString& root, const QString& path, bool readOnly, Stick* stick, QString* error) {
+     const QString connection = QStringLiteral("rx3-mixman-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+     bool ok = false;
+     {
+         QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+         db.setDatabaseName(path);
+-        db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
++        if (readOnly) db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+         if (!db.open()) {
+             if (error) *error = db.lastError().text();
+         } else {
+@@ -307,6 +303,36 @@ inline bool read(const QString& root, Stick* stick, QString* error) {
+     return ok;
+ }
+ 
++// Reads the export. A stick left with a hot rollback journal (pulled right
++// after a save) or on a read-only mount cannot be opened read-only in place, so
++// fall back to a private copy where SQLite may recover; the stick stays untouched.
++inline bool read(const QString& root, Stick* stick, QString* error) {
++    const QString path = databasePath(root);
++    if (path.isEmpty()) {
++        if (error) *error = QStringLiteral("No MIXMAN export found");
++        return false;
++    }
++    QString firstError;
++    *stick = Stick();
++    if (readDatabase(root, path, true, stick, &firstError)) return true;
++    QTemporaryDir dir;
++    if (dir.isValid()) {
++        const QString copy = dir.filePath(QStringLiteral("library.sqlite"));
++        bool copied = QFile::copy(path, copy);
++        for (const char* suffix : {"-journal", "-wal"}) {
++            if (QFileInfo::exists(path + QLatin1String(suffix))) QFile::copy(path + QLatin1String(suffix), copy + QLatin1String(suffix));
++        }
++        QString copyError;
++        *stick = Stick();
++        if (copied && readDatabase(root, copy, false, stick, &copyError)) {
++            stick->databasePath = path;
++            return true;
++        }
++    }
++    if (error) *error = firstError;
++    return false;
++}
++
+ // One track's editable performance data, as saved from the deck.
+ struct Edit {
+     qint64 trackId{0};
+diff --git a/b/src/library/network/networkmanager.h b/src/library/network/networkmanager.h
+new file mode 100644
+index 0000000..5b687df
+--- /dev/null
++++ b/src/library/network/networkmanager.h
+@@ -0,0 +1,696 @@
++#pragma once
++
++// SOURCE > NETWORK. Tracks the remote libraries this machine can see (other
++// NauticMixxx instances through the NMX share protocol, Pioneer players through
++// Pro DJ Link) and gives each one a local cache directory laid out like a USB
++// stick (MIXMAN/... or PIONEER/...), so the normal source machinery can browse,
++// load and import it. Library files arrive up front, audio and per-track
++// analysis on demand (ensureFile), always read-only.
++
++#include <QDir>
++#include <QHostInfo>
++#include <QNetworkDatagram>
++#include <QFile>
++#include <QFileInfo>
++#include <QHash>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QMutex>
++#include <QMutexLocker>
++#include <QObject>
++#include <QSqlDatabase>
++#include <QSqlQuery>
++#include <QThread>
++#include <QTimer>
++#include <QUdpSocket>
++#include <QUuid>
++#include <QtConcurrentRun>
++
++#include <functional>
++#include <memory>
++#include <optional>
++
++#include "library/network/nmxhttp.h"
++#include "library/network/nmxshare.h"
++#include "library/network/prolinkdiscovery.h"
++#include "library/network/prolinknfs.h"
++#include "library/rekordbox/rekordboxdatabase.h"
++#include "preferences/usersettings.h"
++
++namespace mixxx::network {
++
++enum class Protocol { Nautic, Pioneer };
++
++struct NetSource {
++    QString key;            // "nautic-<id>" or "pioneer-<ip>"
++    Protocol protocol{Protocol::Nautic};
++    QString name;
++    QString host;
++    quint16 port{0};
++    QString root;           // cache directory, laid out like a stick
++    QString state;          // "preparing" | "ready" | "error"
++    QString error;
++    bool auth{false};
++    qint64 lastSeenMs{0};
++    qint64 lastAttemptMs{0};
++    bool manual{false};
++    int generation{0};
++    QString mountPath;      // Pioneer: NFS export of the slot ("/C/" USB, "/B/" SD)
++};
++
++class NetworkManager : public QObject {
++  public:
++    explicit NetworkManager(UserSettingsPointer config, QObject* parent = nullptr)
++            : QObject(parent), m_config(std::move(config)) {
++        m_cacheBase = QDir(m_config->getSettingsPath()).filePath(QStringLiteral("network"));
++        s_instance = this;
++    }
++    ~NetworkManager() override {
++        stop();
++        if (s_instance == this) s_instance = nullptr;
++    }
++    static NetworkManager* instance() { return s_instance; }
++
++    // Called from any thread: is this directory one of the network cache roots?
++    static bool isNetworkRoot(const QString& root) {
++        auto* self = s_instance;
++        if (!self || root.isEmpty()) return false;
++        const QString clean = QDir::cleanPath(root);
++        const QString base = QDir::cleanPath(self->m_cacheBase) + QLatin1Char('/');
++        return clean.startsWith(base);
++    }
++
++    void setChangedCallback(std::function<void()> callback) { m_changed = std::move(callback); }
++
++    // ---- lifecycle (GUI thread) ----
++    void start() {
++        if (m_started) return;
++        m_started = true;
++        QDir(m_cacheBase).removeRecursively(); // the cache is per run
++        QDir().mkpath(m_cacheBase);
++        m_ownId = m_config->getValueString(ConfigKey("[RX3Network]", "id"));
++        if (m_ownId.isEmpty()) {
++            m_ownId = QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
++            m_config->setValue(ConfigKey("[RX3Network]", "id"), m_ownId);
++        }
++        m_listen = std::make_unique<QUdpSocket>();
++        if (m_listen->bind(QHostAddress::AnyIPv4, kNmxAnnouncePort,
++                    QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
++            QObject::connect(m_listen.get(), &QUdpSocket::readyRead, this, [this] { readAnnouncements(); });
++        } else {
++            qWarning() << "NMX discovery cannot listen on" << kNmxAnnouncePort << m_listen->errorString();
++        }
++        m_prolink = std::make_unique<QUdpSocket>();
++        if (m_prolink->bind(QHostAddress::AnyIPv4, kProLinkPort,
++                    QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
++            QObject::connect(m_prolink.get(), &QUdpSocket::readyRead, this, [this] { readProLink(); });
++        } else {
++            qWarning() << "Pro DJ Link discovery cannot listen on" << kProLinkPort << m_prolink->errorString();
++        }
++        m_tick = std::make_unique<QTimer>();
++        m_tick->setInterval(3000);
++        QObject::connect(m_tick.get(), &QTimer::timeout, this, [this] { tick(); });
++        m_tick->start();
++        applyShareSettings();
++        tick();
++    }
++
++    void stop() {
++        m_tick.reset();
++        m_listen.reset();
++        m_prolink.reset();
++        m_share.reset();
++        m_started = false;
++    }
++
++    // ---- sources ----
++    QList<NetSource> sources() const {
++        QMutexLocker lock(&m_mutex);
++        return m_sources.values();
++    }
++    std::optional<NetSource> sourceForRoot(const QString& root) const {
++        const QString clean = QDir::cleanPath(root);
++        QMutexLocker lock(&m_mutex);
++        for (const auto& source : m_sources) {
++            if (QDir::cleanPath(source.root) == clean) return source;
++        }
++        return std::nullopt;
++    }
++    QStringList readyRoots() const {
++        QStringList roots;
++        QMutexLocker lock(&m_mutex);
++        for (const auto& source : m_sources) {
++            if (source.state == QLatin1String("ready")) roots.append(source.root);
++        }
++        roots.sort();
++        return roots;
++    }
++    QString ownId() const { return m_ownId; }
++
++    // Forget what we know and fetch the library again.
++    void refresh(const QString& key) {
++        {
++            QMutexLocker lock(&m_mutex);
++            auto it = m_sources.find(key);
++            if (it == m_sources.end()) return;
++            it->state = QStringLiteral("preparing");
++            it->error.clear();
++        }
++        notifyChanged();
++        startSync(key);
++    }
++
++    // ---- sharing settings ----
++    bool shareEnabled() const { return m_config->getValue(ConfigKey("[RX3Network]", "share"), false); }
++    void setShareEnabled(bool enabled) {
++        m_config->setValue(ConfigKey("[RX3Network]", "share"), enabled);
++        applyShareSettings();
++    }
++    QString shareName() const {
++        const QString name = m_config->getValueString(ConfigKey("[RX3Network]", "name"));
++        return name.isEmpty() ? QHostInfo::localHostName() : name;
++    }
++    void setShareName(const QString& name) {
++        m_config->setValue(ConfigKey("[RX3Network]", "name"), name.trimmed().left(40));
++        applyShareSettings();
++    }
++    // A PIN is up to a handful of characters; "----" (nothing chosen) means no PIN.
++    QString pin() const {
++        const QString value = m_config->getValueString(ConfigKey("[RX3Network]", "pin"));
++        return value.trimmed().remove(QLatin1Char('-')).isEmpty() ? QString() : value;
++    }
++    void setPin(const QString& pin) {
++        m_config->setValue(ConfigKey("[RX3Network]", "pin"), pin);
++        applyShareSettings();
++        // A new PIN may unlock peers that refused the old one.
++        QStringList retry;
++        {
++            QMutexLocker lock(&m_mutex);
++            for (auto& source : m_sources) {
++                if (source.state == QLatin1String("error")) retry.append(source.key);
++            }
++        }
++        for (const auto& key : std::as_const(retry)) refresh(key);
++    }
++    QString shareStatus() const {
++        if (!shareEnabled()) return QStringLiteral("OFF");
++        if (!m_share || !m_share->running()) return QStringLiteral("ERROR: %1").arg(m_shareError);
++        return QStringLiteral("ON, port %1").arg(m_share->port());
++    }
++
++    // ---- on-demand files (any thread except the audio thread) ----
++    bool ensureFile(const QString& root, const QString& relativePath, QString* error = nullptr) {
++        std::optional<NetSource> source = sourceForRoot(root);
++        if (!source) {
++            if (error) *error = QStringLiteral("Not a network source");
++            return false;
++        }
++        if (source->protocol == Protocol::Nautic) return ensureNautic(*source, relativePath, error);
++        if (source->protocol == Protocol::Pioneer) return ensurePioneer(*source, relativePath, error);
++        return ensureExtra ? ensureExtra(*source, relativePath, error) : false;
++    }
++
++    // Hooks other protocols register (Pioneer Pro DJ Link).
++    std::function<bool(const NetSource&, const QString&, QString*)> ensureExtra;
++    // Called by protocol modules to publish a source; GUI thread.
++    void upsertSource(const NetSource& source) {
++        {
++            QMutexLocker lock(&m_mutex);
++            auto it = m_sources.find(source.key);
++            if (it == m_sources.end()) {
++                m_sources.insert(source.key, source);
++            } else {
++                const QString state = it->state, error = it->error, root = it->root;
++                const int generation = it->generation;
++                *it = source;
++                if (source.state.isEmpty()) { it->state = state; it->error = error; }
++                if (source.root.isEmpty()) it->root = root;
++                it->generation = generation;
++            }
++        }
++        notifyChanged();
++    }
++    void updateSource(const QString& key, const std::function<void(NetSource&)>& change) {
++        {
++            QMutexLocker lock(&m_mutex);
++            auto it = m_sources.find(key);
++            if (it == m_sources.end()) return;
++            change(*it);
++        }
++        notifyChanged();
++    }
++    void removeSource(const QString& key) {
++        {
++            QMutexLocker lock(&m_mutex);
++            if (m_sources.remove(key) == 0) return;
++        }
++        notifyChanged();
++    }
++    QString cacheBase() const { return m_cacheBase; }
++    UserSettingsPointer config() const { return m_config; }
++    std::function<void()> extraTick; // other protocols hang their housekeeping here
++
++  private:
++    void notifyChanged() {
++        if (!m_changed) return;
++        if (QThread::currentThread() == thread()) m_changed();
++        else QMetaObject::invokeMethod(this, [this] { if (m_changed) m_changed(); }, Qt::QueuedConnection);
++    }
++
++    void applyShareSettings() {
++        const QString pinValue = pin();
++        if (!shareEnabled()) {
++            m_share.reset();
++            m_shareError.clear();
++            return;
++        }
++        if (!m_share) m_share = std::make_unique<NmxServer>(m_config->getSettingsPath());
++        QString error;
++        const quint16 port = quint16(m_config->getValue(ConfigKey("[RX3Network]", "port"), int(kNmxPort)));
++        if (!m_share->start(m_ownId, shareName(), pinValue, port, &error)) {
++            m_shareError = error;
++            qWarning() << "NMX share cannot start:" << error;
++        } else {
++            m_shareError.clear();
++        }
++    }
++
++    void readAnnouncements() {
++        while (m_listen && m_listen->hasPendingDatagrams()) {
++            const QNetworkDatagram datagram = m_listen->receiveDatagram();
++            const QJsonObject json = QJsonDocument::fromJson(datagram.data()).object();
++            if (json.value("nmx").toInt() != kNmxVersion) continue;
++            const QString id = json.value("id").toString();
++            if (id.isEmpty() || id == m_ownId) continue;
++            QHostAddress address = datagram.senderAddress();
++            bool ok = false;
++            const quint32 v4 = address.toIPv4Address(&ok);
++            const QString host = ok ? QHostAddress(v4).toString() : address.toString();
++            seen(id, json.value("name").toString(), host, quint16(json.value("port").toInt(kNmxPort)),
++                    json.value("auth").toBool(), false);
++        }
++    }
++
++    void readProLink() {
++        while (m_prolink && m_prolink->hasPendingDatagrams()) {
++            const QNetworkDatagram datagram = m_prolink->receiveDatagram();
++            ProLinkDevice device;
++            if (!parseProLinkKeepAlive(datagram.data(), &device)) continue;
++            const qint64 now = QDateTime::currentMSecsSinceEpoch();
++            bool hasSource = false;
++            {
++                QMutexLocker lock(&m_mutex);
++                for (auto& source : m_sources) {
++                    if (source.protocol == Protocol::Pioneer && source.host == device.host) {
++                        source.lastSeenMs = now;
++                        hasSource = true;
++                    }
++                }
++            }
++            // Only players carry media. A player without a readable slot is probed
++            // again every 15 s so a stick inserted later shows up.
++            if (!device.isPlayer() || hasSource) continue;
++            auto& probe = m_pioneerProbe[device.host];
++            if (probe.busy || now - probe.lastMs < 15000) continue;
++            probe.busy = true;
++            probe.lastMs = now;
++            startPioneerProbe(device);
++        }
++    }
++
++    // Look for media in each slot of a player, then copy library + analysis files.
++    void startPioneerProbe(const ProLinkDevice& device) {
++        (void)QtConcurrent::run([this, device] {
++            const QList<QPair<QString, QString>> mediaSlots{{QStringLiteral("C"), QStringLiteral("USB")}, {QStringLiteral("B"), QStringLiteral("SD")}};
++            for (const auto& slot : mediaSlots) {
++                const QString mountPath = QStringLiteral("/%1/").arg(slot.first);
++                NfsClient nfs(device.host);
++                if (!nfs.mount(mountPath)) continue;
++                QString pdb;
++                for (const QString& candidate : {QStringLiteral("PIONEER/rekordbox/export.pdb"), QStringLiteral(".PIONEER/rekordbox/export.pdb")}) {
++                    if (nfs.lookupPath(candidate).ok) { pdb = candidate; break; }
++                }
++                if (pdb.isEmpty()) continue;
++                NetSource source;
++                source.key = QStringLiteral("pioneer-%1-%2").arg(nmxSanitize(device.host, QStringLiteral("device")), slot.first.toLower());
++                source.protocol = Protocol::Pioneer;
++                source.host = device.host;
++                source.mountPath = mountPath;
++                source.name = QStringLiteral("%1%2 %3").arg(device.name,
++                        device.isPlayer() ? QStringLiteral(" P%1").arg(device.number) : QString(),
++                        slot.second);
++                source.root = QDir(m_cacheBase).filePath(source.key);
++                source.state = QStringLiteral("preparing");
++                source.lastSeenMs = QDateTime::currentMSecsSinceEpoch();
++                QMetaObject::invokeMethod(this, [this, source] { upsertSource(source); }, Qt::QueuedConnection);
++                QString error;
++                const bool ok = syncPioneer(source, pdb, &error);
++                QMetaObject::invokeMethod(this, [this, key = source.key, ok, error] {
++                    updateSource(key, [&](NetSource& s) {
++                        s.state = ok ? QStringLiteral("ready") : QStringLiteral("error");
++                        s.error = error;
++                        ++s.generation;
++                    });
++                }, Qt::QueuedConnection);
++            }
++            QMetaObject::invokeMethod(this, [this, host = device.host] {
++                m_pioneerProbe[host].busy = false;
++                m_pioneerProbe[host].lastMs = QDateTime::currentMSecsSinceEpoch();
++            }, Qt::QueuedConnection);
++        });
++    }
++
++    bool fetchPioneerFile(NfsClient& nfs, const NetSource& source, const QString& relative, QString* error) {
++        const QString target = QDir(source.root).filePath(relative);
++        QDir().mkpath(QFileInfo(target).absolutePath());
++        QFile part(target + QStringLiteral(".part"));
++        if (!part.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
++            if (error) *error = QStringLiteral("Cannot write the cache");
++            return false;
++        }
++        if (!nfs.readFile(relative, &part, [this] { return m_started; })) {
++            part.close();
++            part.remove();
++            if (error) *error = nfs.error();
++            return false;
++        }
++        part.close();
++        QFile::remove(target);
++        if (!QFile::rename(part.fileName(), target)) {
++            if (error) *error = QStringLiteral("Cannot publish the cached file");
++            return false;
++        }
++        return true;
++    }
++
++    bool syncPioneer(const NetSource& source, const QString& pdbRelative, QString* error) {
++        NfsClient nfs(source.host);
++        if (!nfs.mount(source.mountPath)) {
++            *error = nfs.error();
++            return false;
++        }
++        QDir().mkpath(source.root);
++        if (!fetchPioneerFile(nfs, source, pdbRelative, error)) return false;
++        const QString extended = QFileInfo(pdbRelative).path() + QStringLiteral("/exportExt.pdb");
++        QString ignored;
++        fetchPioneerFile(nfs, source, extended, &ignored); // optional
++        const auto document = rekordbox::readDatabaseFile(QDir(source.root).filePath(pdbRelative), rekordbox::DatabaseKind::Main);
++        if (!document.valid()) {
++            *error = document.error.isEmpty() ? QStringLiteral("Unreadable export.pdb") : document.error;
++            return false;
++        }
++        const auto tracks = rekordbox::readTrackIndex(document);
++        for (const auto& track : tracks.tracks) {
++            if (!m_started) return false;
++            QString analysis = track.analysisPath;
++            while (analysis.startsWith(QLatin1Char('/'))) analysis.remove(0, 1);
++            if (analysis.isEmpty() || analysis.contains(QStringLiteral(".."))) continue;
++            const QString base = analysis.left(analysis.lastIndexOf(QLatin1Char('.')));
++            for (const char* extension : {".DAT", ".EXT", ".2EX"}) {
++                QString skipped;
++                fetchPioneerFile(nfs, source, base + QLatin1String(extension), &skipped); // best effort
++            }
++        }
++        return true;
++    }
++
++    bool ensurePioneer(const NetSource& source, const QString& relativePath, QString* error) {
++        QString clean = relativePath;
++        clean.replace(QLatin1Char('\\'), QLatin1Char('/'));
++        while (clean.startsWith(QLatin1Char('/'))) clean.remove(0, 1);
++        if (clean.isEmpty() || clean.contains(QStringLiteral(".."))) {
++            if (error) *error = QStringLiteral("Bad path");
++            return false;
++        }
++        const QString target = QDir(source.root).filePath(clean);
++        const auto fileLock = pathLock(target);
++        QMutexLocker lock(fileLock.get());
++        const QFileInfo existing(target);
++        if (existing.isFile() && existing.size() > 0) return true;
++        NfsClient nfs(source.host, 3000);
++        if (!nfs.mount(source.mountPath)) {
++            if (error) *error = nfs.error();
++            return false;
++        }
++        return fetchPioneerFile(nfs, source, clean, error);
++    }
++
++    // A peer was heard (announcement or manual poll).
++    void seen(const QString& id, const QString& name, const QString& host, quint16 port, bool auth, bool manual) {
++        const QString key = QStringLiteral("nautic-") + nmxSanitize(id, QStringLiteral("peer"));
++        bool created = false;
++        {
++            QMutexLocker lock(&m_mutex);
++            auto it = m_sources.find(key);
++            if (it == m_sources.end()) {
++                NetSource source;
++                source.key = key;
++                source.protocol = Protocol::Nautic;
++                source.root = QDir(m_cacheBase).filePath(key);
++                source.state = QStringLiteral("preparing");
++                it = m_sources.insert(key, source);
++                created = true;
++            }
++            it->name = name.isEmpty() ? host : name;
++            it->host = host;
++            it->port = port;
++            it->auth = auth;
++            it->manual = manual;
++            it->lastSeenMs = QDateTime::currentMSecsSinceEpoch();
++        }
++        if (created) {
++            notifyChanged();
++            startSync(key);
++        }
++    }
++
++    void tick() {
++        const qint64 now = QDateTime::currentMSecsSinceEpoch();
++        QStringList gone, retry;
++        {
++            QMutexLocker lock(&m_mutex);
++            for (auto& source : m_sources) {
++                if (source.protocol == Protocol::Pioneer) {
++                    if (now - source.lastSeenMs > 10000) gone.append(source.key);
++                    continue;
++                }
++                if (now - source.lastSeenMs > 12000) gone.append(source.key);
++                else if (source.state == QLatin1String("error") && now - source.lastAttemptMs > 20000) retry.append(source.key);
++            }
++        }
++        for (const auto& key : std::as_const(gone)) removeSource(key);
++        for (const auto& key : std::as_const(retry)) refresh(key);
++        pollManualHosts();
++        if (extraTick) extraTick();
++    }
++
++    // `[RX3Network] hosts`: "192.168.1.20,studio.local:48210" for networks that do not forward broadcasts.
++    void pollManualHosts() {
++        const QStringList hosts = m_config->getValueString(ConfigKey("[RX3Network]", "hosts"))
++                                          .split(QLatin1Char(','), Qt::SkipEmptyParts);
++        for (const QString& entry : hosts) {
++            const QString trimmed = entry.trimmed();
++            QString host = trimmed;
++            quint16 port = kNmxPort;
++            const int colon = trimmed.lastIndexOf(QLatin1Char(':'));
++            if (colon > 0) {
++                host = trimmed.left(colon);
++                port = quint16(trimmed.mid(colon + 1).toUInt());
++            }
++            if (host.isEmpty() || m_polling.contains(trimmed)) continue;
++            m_polling.insert(trimmed);
++            const QString pinValue = pin();
++            (void)QtConcurrent::run([this, trimmed, host, port, pinValue] {
++                HttpResponse response;
++                const QByteArray path = "/nmx/v1/info";
++                const bool ok = httpGet(host, port, path, nmxAuthHeaders(pinValue, path), nullptr, &response, 2500);
++                QMetaObject::invokeMethod(this, [this, trimmed, host, port, ok, response] {
++                    m_polling.remove(trimmed);
++                    if (!ok && response.status != 401) return;
++                    const QJsonObject json = QJsonDocument::fromJson(response.body).object();
++                    const QString id = json.value("id").toString();
++                    if (ok && !id.isEmpty() && id != m_ownId)
++                        seen(id, json.value("name").toString(), host, port, json.value("auth").toBool(), true);
++                }, Qt::QueuedConnection);
++            });
++        }
++    }
++
++    // Library snapshot + summaries, then publish as ready.
++    void startSync(const QString& key) {
++        NetSource source;
++        {
++            QMutexLocker lock(&m_mutex);
++            auto it = m_sources.find(key);
++            if (it == m_sources.end()) return;
++            if (it->state == QLatin1String("syncing")) return;
++            it->lastAttemptMs = QDateTime::currentMSecsSinceEpoch();
++            source = *it;
++        }
++        const QString pinValue = pin();
++        (void)QtConcurrent::run([this, source, pinValue] {
++            QString error;
++            const bool ok = syncNautic(source, pinValue, &error);
++            QMetaObject::invokeMethod(this, [this, key = source.key, ok, error] {
++                updateSource(key, [&](NetSource& s) {
++                    s.state = ok ? QStringLiteral("ready") : QStringLiteral("error");
++                    s.error = error;
++                    ++s.generation;
++                });
++            }, Qt::QueuedConnection);
++        });
++    }
++
++    bool syncNautic(const NetSource& source, const QString& pinValue, QString* error) {
++        const auto get = [&](const QByteArray& path, QIODevice* sink, HttpResponse* response, int timeout) {
++            return httpGet(source.host, source.port, path, nmxAuthHeaders(pinValue, path), sink, response, timeout);
++        };
++        HttpResponse info;
++        if (!get("/nmx/v1/info", nullptr, &info, 5000)) {
++            *error = info.status == 401 ? QStringLiteral("PIN required or wrong") : info.error;
++            return false;
++        }
++        QDir().mkpath(QDir(source.root).filePath(QStringLiteral("MIXMAN/analysis")));
++        const QString database = QDir(source.root).filePath(QStringLiteral("MIXMAN/library.sqlite"));
++        {
++            QFile part(database + QStringLiteral(".part"));
++            if (!part.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
++                *error = QStringLiteral("Cannot write the cache");
++                return false;
++            }
++            HttpResponse library;
++            if (!get("/nmx/v1/library", &part, &library, 60000)) {
++                *error = library.error;
++                return false;
++            }
++        }
++        HttpResponse summaries;
++        if (get("/nmx/v1/summaries", nullptr, &summaries, 60000)) {
++            const QByteArray& data = summaries.body;
++            int offset = 0;
++            while (offset + 8 <= data.size()) {
++                const quint32 id = qFromBigEndian<quint32>(data.constData() + offset);
++                const quint32 length = qFromBigEndian<quint32>(data.constData() + offset + 4);
++                offset += 8;
++                if (qint64(offset) + length > data.size()) break;
++                QFile out(QDir(source.root).filePath(QStringLiteral("MIXMAN/analysis/") + QString::number(id)));
++                if (out.open(QIODevice::WriteOnly | QIODevice::Truncate)) out.write(data.constData() + offset, length);
++                offset += int(length);
++            }
++        }
++        // rel path -> (track id, size), for on-demand audio.
++        QHash<QString, QPair<qint64, qint64>> files;
++        {
++            const QString connection = QStringLiteral("nmx-index-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
++            {
++                QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
++                db.setDatabaseName(database + QStringLiteral(".part"));
++                db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
++                if (db.open()) {
++                    QSqlQuery q(db);
++                    if (q.exec(QStringLiteral("SELECT l.id, tl.location, tl.filesize FROM library l "
++                                              "JOIN track_locations tl ON tl.id = l.location"))) {
++                        while (q.next()) files.insert(q.value(1).toString(), {q.value(0).toLongLong(), q.value(2).toLongLong()});
++                    }
++                    db.close();
++                }
++            }
++            QSqlDatabase::removeDatabase(connection);
++        }
++        if (files.isEmpty()) {
++            // An empty share is still a valid, browsable (empty) source.
++        }
++        {
++            QMutexLocker lock(&m_filesMutex);
++            m_files.insert(source.key, files);
++        }
++        QFile::remove(database);
++        if (!QFile::rename(database + QStringLiteral(".part"), database)) {
++            *error = QStringLiteral("Cannot publish the cache");
++            return false;
++        }
++        return true;
++    }
++
++    bool ensureNautic(const NetSource& source, const QString& relativePath, QString* error) {
++        // Waveform analysis files are addressed by id.
++        QString clean = relativePath;
++        clean.replace(QLatin1Char('\\'), QLatin1Char('/'));
++        if (clean.contains(QStringLiteral("..")) || clean.isEmpty()) {
++            if (error) *error = QStringLiteral("Bad path");
++            return false;
++        }
++        QByteArray url;
++        qint64 expected = -1;
++        if (clean.startsWith(QStringLiteral("MIXMAN/analysis/"))) {
++            bool numeric = false;
++            clean.mid(QStringLiteral("MIXMAN/analysis/").size()).toLongLong(&numeric);
++            if (!numeric) { if (error) *error = QStringLiteral("Bad analysis path"); return false; }
++            url = "/nmx/v1/analysis/" + clean.mid(QStringLiteral("MIXMAN/analysis/").size()).toUtf8();
++        } else {
++            QPair<qint64, qint64> entry{-1, -1};
++            {
++                QMutexLocker lock(&m_filesMutex);
++                const auto files = m_files.value(source.key);
++                const auto it = files.constFind(clean);
++                if (it != files.cend()) entry = *it;
++            }
++            if (entry.first < 0) { if (error) *error = QStringLiteral("Unknown file"); return false; }
++            url = "/nmx/v1/audio/" + QByteArray::number(entry.first);
++            expected = entry.second;
++        }
++        const QString target = QDir(source.root).filePath(clean);
++        const auto fileLock = pathLock(target);
++        QMutexLocker lock(fileLock.get());
++        const QFileInfo existing(target);
++        if (existing.isFile() && existing.size() > 0 && (expected < 0 || existing.size() == expected)) return true;
++        QDir().mkpath(existing.absolutePath());
++        QFile part(target + QStringLiteral(".part"));
++        if (!part.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
++            if (error) *error = QStringLiteral("Cannot write the cache");
++            return false;
++        }
++        HttpResponse response;
++        const QString pinValue = pin();
++        if (!httpGet(source.host, source.port, url, nmxAuthHeaders(pinValue, url), &part, &response, 20000)) {
++            part.close();
++            part.remove();
++            if (error) *error = response.error;
++            return false;
++        }
++        part.close();
++        QFile::remove(target);
++        if (!QFile::rename(part.fileName(), target)) {
++            if (error) *error = QStringLiteral("Cannot publish the cached file");
++            return false;
++        }
++        return true;
++    }
++
++    std::shared_ptr<QMutex> pathLock(const QString& path) {
++        QMutexLocker lock(&m_lockMutex);
++        auto& slot = m_pathLocks[path];
++        if (!slot) slot = std::make_shared<QMutex>();
++        return slot;
++    }
++
++    UserSettingsPointer m_config;
++    QString m_cacheBase, m_ownId, m_shareError;
++    mutable QMutex m_mutex;
++    QHash<QString, NetSource> m_sources;
++    QMutex m_filesMutex, m_lockMutex;
++    QHash<QString, QHash<QString, QPair<qint64, qint64>>> m_files;
++    QHash<QString, std::shared_ptr<QMutex>> m_pathLocks;
++    QSet<QString> m_polling;
++    struct PioneerProbe { bool busy{false}; qint64 lastMs{0}; };
++    QHash<QString, PioneerProbe> m_pioneerProbe;
++    std::unique_ptr<QUdpSocket> m_listen;
++    std::unique_ptr<QUdpSocket> m_prolink;
++    std::unique_ptr<QTimer> m_tick;
++    std::unique_ptr<NmxServer> m_share;
++    std::function<void()> m_changed;
++    bool m_started{false};
++    inline static NetworkManager* s_instance = nullptr;
++};
++
++} // namespace mixxx::network
+diff --git a/b/src/library/network/nmxhttp.h b/src/library/network/nmxhttp.h
+new file mode 100644
+index 0000000..5fe2c83
+--- /dev/null
++++ b/src/library/network/nmxhttp.h
+@@ -0,0 +1,136 @@
++#pragma once
++
++// Tiny blocking HTTP/1.1 GET client for the NauticMixxx share protocol
++// ("NMX", see docs/NETWORK-SOURCE-2.4-EN.md). It runs on whatever thread calls
++// it (never the audio thread) and streams the body to a QIODevice, so a track
++// can be copied to the cache without holding it in memory.
++
++#include <QByteArray>
++#include <QCryptographicHash>
++#include <QDateTime>
++#include <QElapsedTimer>
++#include <QIODevice>
++#include <QList>
++#include <QMessageAuthenticationCode>
++#include <QPair>
++#include <QString>
++#include <QTcpSocket>
++
++#include <functional>
++
++namespace mixxx::network {
++
++constexpr quint16 kNmxPort = 48210;           // TCP: HTTP. UDP: announcements (kNmxPort + 1).
++constexpr quint16 kNmxAnnouncePort = 48211;
++constexpr int kNmxVersion = 1;
++
++struct HttpResponse {
++    int status{0};
++    qint64 contentLength{-1};
++    QByteArray body; // only when no sink was given
++    QString error;
++};
++
++// X-NMX-Sig = hex(HMAC-SHA256(pin, "GET\n<path>\n<unix time>")). With an empty PIN nothing is signed.
++inline QByteArray nmxSignature(const QString& pin, const QByteArray& method,
++        const QByteArray& path, const QByteArray& time) {
++    return QMessageAuthenticationCode::hash(QByteArray(method + '\n' + path + '\n' + time),
++            pin.toUtf8(), QCryptographicHash::Sha256).toHex();
++}
++
++inline QList<QPair<QByteArray, QByteArray>> nmxAuthHeaders(const QString& pin, const QByteArray& path) {
++    QList<QPair<QByteArray, QByteArray>> headers;
++    if (pin.isEmpty()) return headers;
++    const QByteArray time = QByteArray::number(QDateTime::currentSecsSinceEpoch());
++    headers.append({"X-NMX-Time", time});
++    headers.append({"X-NMX-Sig", nmxSignature(pin, "GET", path, time)});
++    return headers;
++}
++
++// Returns true when the server answered 200. `progress` may cancel by returning false.
++inline bool httpGet(const QString& host, quint16 port, const QByteArray& path,
++        const QList<QPair<QByteArray, QByteArray>>& headers, QIODevice* sink,
++        HttpResponse* out, int timeoutMs = 8000, qint64 maxBytes = Q_INT64_C(8) << 30,
++        const std::function<bool(qint64)>& progress = {}) {
++    HttpResponse local;
++    HttpResponse& response = out ? *out : local;
++    response = {};
++    QTcpSocket socket;
++    socket.connectToHost(host, port);
++    if (!socket.waitForConnected(timeoutMs)) {
++        response.error = QStringLiteral("Cannot connect to %1:%2").arg(host).arg(port);
++        return false;
++    }
++    QByteArray request = "GET " + path + " HTTP/1.1\r\nHost: " + host.toUtf8() + ':' +
++            QByteArray::number(port) + "\r\nConnection: close\r\nUser-Agent: NauticMixxx-NMX/1\r\n";
++    for (const auto& header : headers) request += header.first + ": " + header.second + "\r\n";
++    request += "\r\n";
++    socket.write(request);
++    if (!socket.waitForBytesWritten(timeoutMs)) {
++        response.error = QStringLiteral("Request not sent");
++        return false;
++    }
++    QByteArray buffer;
++    bool headerDone = false;
++    qint64 received = 0;
++    const auto consume = [&](const QByteArray& data) -> bool {
++        received += data.size();
++        if (received > maxBytes) { response.error = QStringLiteral("Response too large"); return false; }
++        if (sink) {
++            if (sink->write(data) != data.size()) { response.error = QStringLiteral("Cannot write the cache file"); return false; }
++        } else {
++            response.body += data;
++        }
++        if (progress && !progress(received)) { response.error = QStringLiteral("Cancelled"); return false; }
++        return true;
++    };
++    while (true) {
++        if (socket.bytesAvailable() == 0 && !socket.waitForReadyRead(timeoutMs)) {
++            if (socket.state() != QAbstractSocket::ConnectedState && headerDone) break; // closed
++            if (socket.state() == QAbstractSocket::ConnectedState) {
++                response.error = QStringLiteral("Timed out");
++                return false;
++            }
++            break;
++        }
++        const QByteArray chunk = socket.readAll();
++        if (!headerDone) {
++            buffer += chunk;
++            const int end = buffer.indexOf("\r\n\r\n");
++            if (end < 0) {
++                if (buffer.size() > 32768) { response.error = QStringLiteral("Bad response"); return false; }
++                continue;
++            }
++            const QList<QByteArray> lines = buffer.left(end).split('\n');
++            const QList<QByteArray> status = lines.value(0).trimmed().split(' ');
++            response.status = status.value(1).toInt();
++            for (int i = 1; i < lines.size(); ++i) {
++                const int colon = lines[i].indexOf(':');
++                if (colon > 0 && lines[i].left(colon).trimmed().toLower() == "content-length")
++                    response.contentLength = lines[i].mid(colon + 1).trimmed().toLongLong();
++            }
++            headerDone = true;
++            const QByteArray rest = buffer.mid(end + 4);
++            buffer.clear();
++            if (response.status != 200) {
++                response.error = QStringLiteral("HTTP %1").arg(response.status);
++                return false;
++            }
++            if (!rest.isEmpty() && !consume(rest)) return false;
++        } else if (!consume(chunk)) {
++            return false;
++        }
++        if (headerDone && response.contentLength >= 0 && received >= response.contentLength) break;
++    }
++    if (!headerDone) {
++        response.error = QStringLiteral("No response");
++        return false;
++    }
++    if (response.contentLength >= 0 && received < response.contentLength) {
++        response.error = QStringLiteral("Connection closed early");
++        return false;
++    }
++    return true;
++}
++
++} // namespace mixxx::network
+diff --git a/b/src/library/network/nmxshare.h b/src/library/network/nmxshare.h
+new file mode 100644
+index 0000000..3542376
+--- /dev/null
++++ b/src/library/network/nmxshare.h
+@@ -0,0 +1,461 @@
++#pragma once
++
++// NauticMixxx share server (NMX v1): read-only access to this machine's STORAGE
++// library for other NauticMixxx instances. Nothing here can write or delete.
++//
++//   GET /nmx/v1/info        {"nmx":1,"id":...,"name":...,"auth":bool}
++//   GET /nmx/v1/library     a MIXMAN-format SQLite snapshot (tracks, cues, grids,
++//                           crates, playlists; audio paths relative to Contents/)
++//   GET /nmx/v1/summaries   all waveform summaries: repeated [u32 id][u32 len][bytes]
++//   GET /nmx/v1/analysis/N  one stored waveform analysis file
++//   GET /nmx/v1/audio/N     the audio file of library track N (Range not needed)
++//
++// Only files that belong to tracks of the snapshot are ever served, addressed by
++// track id, never by path. With a PIN every request must carry X-NMX-Time and
++// X-NMX-Sig (HMAC-SHA256, see nmxhttp.h). Sharing is off unless the user turns it on.
++
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QHash>
++#include <QHostInfo>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QMutex>
++#include <QMutexLocker>
++#include <QNetworkDatagram>
++#include <QNetworkInterface>
++#include <QRegularExpression>
++#include <QSet>
++#include <QSqlDatabase>
++#include <QSqlError>
++#include <QSqlQuery>
++#include <QTcpServer>
++#include <QThreadPool>
++#include <QTimer>
++#include <QUdpSocket>
++#include <QUuid>
++#include <QtEndian>
++
++#include <algorithm>
++#include <atomic>
++
++#include <memory>
++
++#include "library/network/nmxhttp.h"
++
++namespace mixxx::network {
++
++inline QString nmxSanitize(QString text, const QString& fallback) {
++    text.replace(QRegularExpression(QStringLiteral("[\\\\/:*?\"<>|\\x00-\\x1f]")), QStringLiteral("_"));
++    text = text.trimmed();
++    while (text.startsWith(QLatin1Char('.'))) text.remove(0, 1);
++    if (text.size() > 120) text = text.left(120);
++    return text.isEmpty() ? fallback : text;
++}
++
++// What the server knows about the last snapshot: which files belong to which id.
++struct NmxCatalog {
++    QMutex mutex;
++    QString settingsPath;
++    QString exportId;
++    QByteArray snapshot;            // the SQLite file
++    QByteArray summaries;           // bundled type-2 analyses
++    QHash<qint64, QString> audio;   // track id -> absolute file
++    QSet<qint64> analysisIds;
++    qint64 builtAtMs{0};
++    int tracks{0};
++};
++
++inline bool nmxBuildSnapshot(const QString& settingsPath, const QString& exportId,
++        QByteArray* file, QByteArray* summaries, QHash<qint64, QString>* audio,
++        QSet<qint64>* analysisIds, int* trackCount, QString* error) {
++    const QString source = QDir(settingsPath).filePath(QStringLiteral("mixxxdb.sqlite"));
++    if (!QFileInfo::exists(source)) {
++        if (error) *error = QStringLiteral("No library database");
++        return false;
++    }
++    const QString temp = QDir::temp().filePath(QStringLiteral("nmx-snapshot-") +
++            QUuid::createUuid().toString(QUuid::WithoutBraces) + QStringLiteral(".sqlite"));
++    const QString connection = QStringLiteral("nmx-snapshot-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
++    QList<qint64> summaryIds;
++    bool ok = false;
++    {
++        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
++        db.setDatabaseName(temp);
++        if (!db.open()) {
++            if (error) *error = db.lastError().text();
++        } else {
++            ok = [&]() -> bool {
++                QSqlQuery q(db);
++                const auto fail = [&](const QString& message) {
++                    if (error) *error = message;
++                    return false;
++                };
++                const auto exec = [&](const QString& sql) {
++                    if (!q.exec(sql)) {
++                        if (error) *error = q.lastError().text() + QStringLiteral(" in: ") + sql.left(80);
++                        return false;
++                    }
++                    return true;
++                };
++                static const QStringList ddl{
++                    "CREATE TABLE library(id INT,artist TEXT,title TEXT,album TEXT,year TEXT,genre TEXT,tracknumber TEXT,location INT,comment TEXT,url TEXT,duration REAL,bitrate INT,samplerate INT,cuepoint INT,bpm REAL,wavesummaryhex,channels INT,datetime_added,mixxx_deleted INT,played INT,header_parsed INT,filetype TEXT,replaygain REAL,timesplayed INT,rating INT,\"key\" TEXT,beats,beats_version TEXT,composer TEXT,bpm_lock INT,beats_sub_version TEXT,keys,keys_version TEXT,keys_sub_version TEXT,key_id INT,grouping TEXT,album_artist TEXT,color INT,last_played_at NUM)",
++                    "CREATE TABLE track_locations(id INT,location TEXT,filename TEXT,directory TEXT,filesize INT,fs_deleted INT,needs_verification INT)",
++                    "CREATE TABLE cues(id INT,track_id INT,type INT,position INT,length INT,hotcue INT,label TEXT,color INT)",
++                    "CREATE TABLE crates(id INT,name TEXT,count INT,show INT,locked INT,autodj_source INT)",
++                    "CREATE TABLE crate_tracks(crate_id INT,track_id INT)",
++                    "CREATE TABLE Playlists(id INT,name TEXT,position INT,hidden INT,date_created NUM,date_modified NUM,locked INT)",
++                    "CREATE TABLE PlaylistTracks(id INT,playlist_id INT,track_id INT,position INT,pl_datetime_added)",
++                    "CREATE TABLE track_analysis(id INT,track_id INT,type TEXT,description TEXT,version TEXT,created,data_checksum TEXT)",
++                    "CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)",
++                    "CREATE TEMP TABLE sel(id INT PRIMARY KEY)"};
++                for (const auto& sql : ddl) if (!exec(sql)) return false;
++                q.prepare(QStringLiteral("ATTACH DATABASE ? AS src"));
++                q.addBindValue(source);
++                if (!q.exec()) { if (error) *error = q.lastError().text(); return false; }
++                if (!exec(QStringLiteral("BEGIN"))) return false;
++
++                QSqlQuery tracks(db);
++                if (!tracks.exec(QStringLiteral(
++                            "SELECT l.id, l.artist, tl.id, tl.location, tl.filename, tl.filesize "
++                            "FROM src.library l JOIN src.track_locations tl ON tl.id = l.location "
++                            "WHERE COALESCE(l.mixxx_deleted,0)=0 AND COALESCE(tl.fs_deleted,0)=0 ORDER BY l.id"))) {
++                    if (error) *error = tracks.lastError().text();
++                    return false;
++                }
++                QSet<QString> used;
++                QSqlQuery insertLocation(db), insertSel(db);
++                insertLocation.prepare(QStringLiteral("INSERT INTO track_locations VALUES(?,?,?,?,?,0,0)"));
++                insertSel.prepare(QStringLiteral("INSERT INTO sel VALUES(?)"));
++                int count = 0;
++                while (tracks.next()) {
++                    const qint64 id = tracks.value(0).toLongLong();
++                    const QString absolute = tracks.value(3).toString();
++                    if (id <= 0 || id > 0x7fffffffLL || !QFileInfo(absolute).isFile()) continue;
++                    const QString artist = nmxSanitize(tracks.value(1).toString(), QStringLiteral("Unknown Artist"));
++                    QString name = nmxSanitize(tracks.value(4).toString().isEmpty() ? QFileInfo(absolute).fileName() : tracks.value(4).toString(),
++                            QStringLiteral("track"));
++                    QString directory = QStringLiteral("MIXMAN/Contents/") + artist;
++                    QString relative = directory + QLatin1Char('/') + name;
++                    if (used.contains(relative.toLower())) {
++                        const QFileInfo info(name);
++                        name = info.completeBaseName() + QStringLiteral(" (") + QString::number(id) + QStringLiteral(")") +
++                                (info.suffix().isEmpty() ? QString() : QStringLiteral(".") + info.suffix());
++                        relative = directory + QLatin1Char('/') + name;
++                    }
++                    used.insert(relative.toLower());
++                    insertLocation.addBindValue(tracks.value(2));
++                    insertLocation.addBindValue(relative);
++                    insertLocation.addBindValue(name);
++                    insertLocation.addBindValue(directory);
++                    insertLocation.addBindValue(QFileInfo(absolute).size());
++                    if (!insertLocation.exec()) return fail(insertLocation.lastError().text());
++                    insertSel.addBindValue(id);
++                    if (!insertSel.exec()) return fail(insertSel.lastError().text());
++                    (*audio)[id] = absolute;
++                    ++count;
++                }
++                const QString columns = QStringLiteral(
++                        "id,artist,title,album,year,genre,tracknumber,location,comment,url,duration,bitrate,samplerate,"
++                        "cuepoint,bpm,wavesummaryhex,channels,datetime_added,mixxx_deleted,played,header_parsed,filetype,"
++                        "replaygain,timesplayed,rating,\"key\",beats,beats_version,composer,bpm_lock,beats_sub_version,"
++                        "keys,keys_version,keys_sub_version,key_id,grouping,album_artist,color,last_played_at");
++                for (const auto& sql : QStringList{
++                             QStringLiteral("INSERT INTO library(%1) SELECT %1 FROM src.library WHERE id IN (SELECT id FROM sel)").arg(columns),
++                             QStringLiteral("INSERT INTO cues SELECT id,track_id,type,position,length,hotcue,label,color FROM src.cues WHERE track_id IN (SELECT id FROM sel)"),
++                             QStringLiteral("INSERT INTO crates SELECT id,name,count,show,locked,autodj_source FROM src.crates WHERE COALESCE(show,1)=1"),
++                             QStringLiteral("INSERT INTO crate_tracks SELECT crate_id,track_id FROM src.crate_tracks WHERE track_id IN (SELECT id FROM sel)"),
++                             QStringLiteral("INSERT INTO Playlists SELECT id,name,position,hidden,date_created,date_modified,locked FROM src.Playlists WHERE COALESCE(hidden,0)=0"),
++                             QStringLiteral("INSERT INTO PlaylistTracks SELECT id,playlist_id,track_id,position,pl_datetime_added FROM src.PlaylistTracks WHERE track_id IN (SELECT id FROM sel) AND playlist_id IN (SELECT id FROM Playlists)"),
++                             QStringLiteral("INSERT INTO track_analysis SELECT id,track_id,type,description,version,created,data_checksum FROM src.track_analysis WHERE type IN (1,2) AND track_id IN (SELECT id FROM sel)")}) {
++                    if (!exec(sql)) return false;
++                }
++                q.prepare(QStringLiteral("INSERT INTO meta VALUES(?,?)"));
++                const QList<QPair<QString, QString>> meta{{"format", "mixman-export"}, {"format_version", "1"},
++                        {"mixxx_schema_version", "40"}, {"created_unix", QString::number(QDateTime::currentSecsSinceEpoch())},
++                        {"export_id", exportId}, {"app_version", "nauticmixxx-nmx1"}};
++                for (const auto& item : meta) {
++                    q.addBindValue(item.first);
++                    q.addBindValue(item.second);
++                    if (!q.exec()) return fail(q.lastError().text());
++                }
++                if (!exec(QStringLiteral("COMMIT"))) return false;
++                QSqlQuery analysis(db);
++                if (analysis.exec(QStringLiteral("SELECT id, CAST(type AS INTEGER) FROM track_analysis"))) {
++                    while (analysis.next()) {
++                        analysisIds->insert(analysis.value(0).toLongLong());
++                        if (analysis.value(1).toInt() == 2) summaryIds.append(analysis.value(0).toLongLong());
++                    }
++                }
++                *trackCount = count;
++                exec(QStringLiteral("DETACH DATABASE src"));
++                return true;
++            }();
++            db.close();
++        }
++    }
++    QSqlDatabase::removeDatabase(connection);
++    if (ok) {
++        QFile out(temp);
++        if (out.open(QIODevice::ReadOnly)) *file = out.readAll();
++        else { ok = false; if (error) *error = QStringLiteral("Cannot read the snapshot"); }
++    }
++    QFile::remove(temp);
++    QFile::remove(temp + QStringLiteral("-journal"));
++    if (ok) {
++        // Summaries: every type-2 analysis file, bundled as [u32 id][u32 length][bytes].
++        for (const qint64 id : std::as_const(summaryIds)) {
++            QFile analysisFile(QDir(settingsPath).filePath(QStringLiteral("analysis/") + QString::number(id)));
++            if (!analysisFile.open(QIODevice::ReadOnly) || analysisFile.size() > 8 * 1024 * 1024) continue;
++            const QByteArray data = analysisFile.readAll();
++            QByteArray head(8, 0);
++            qToBigEndian<quint32>(quint32(id), head.data());
++            qToBigEndian<quint32>(quint32(data.size()), head.data() + 4);
++            *summaries += head + data;
++        }
++    }
++    return ok;
++}
++
++
++// Shared state of one running share.
++class NmxServer {
++  public:
++    explicit NmxServer(QString settingsPath)
++            : m_catalog(std::make_shared<NmxCatalog>()) {
++        m_catalog->settingsPath = std::move(settingsPath);
++        m_pool.setMaxThreadCount(6);
++    }
++    ~NmxServer() { stop(); }
++    NmxServer(const NmxServer&) = delete;
++    NmxServer& operator=(const NmxServer&) = delete;
++
++    bool running() const { return m_listener && m_listener->isListening(); }
++    quint16 port() const { return m_listener ? m_listener->serverPort() : 0; }
++    const QString& id() const { return m_id; }
++
++    // GUI thread. `id` is stable per installation.
++    bool start(const QString& id, const QString& name, const QString& pin,
++            quint16 portNumber, QString* error) {
++        stop();
++        m_id = id;
++        m_name = name;
++        m_pin = pin;
++        m_stopping = false;
++        m_listener = std::make_unique<Listener>(this);
++        if (!m_listener->listen(QHostAddress::Any, portNumber)) {
++            if (error) *error = m_listener->errorString();
++            m_listener.reset();
++            return false;
++        }
++        m_socket = std::make_unique<QUdpSocket>();
++        m_timer = std::make_unique<QTimer>();
++        m_timer->setInterval(2000);
++        QObject::connect(m_timer.get(), &QTimer::timeout, m_timer.get(), [this] { announce(); });
++        m_timer->start();
++        announce();
++        return true;
++    }
++
++    void stop() {
++        m_stopping = true;
++        m_timer.reset();
++        m_socket.reset();
++        if (m_listener) m_listener->close();
++        m_pool.waitForDone(6000);
++        m_listener.reset();
++        QMutexLocker lock(&m_catalog->mutex);
++        m_catalog->snapshot.clear();
++        m_catalog->summaries.clear();
++        m_catalog->audio.clear();
++        m_catalog->analysisIds.clear();
++        m_catalog->builtAtMs = 0;
++    }
++
++  private:
++    class Listener final : public QTcpServer {
++      public:
++        explicit Listener(NmxServer* owner) : m_owner(owner) {}
++      protected:
++        void incomingConnection(qintptr descriptor) override { m_owner->accept(descriptor); }
++      private:
++        NmxServer* m_owner;
++    };
++
++    void announce() {
++        if (!m_socket || !m_listener) return;
++        const QByteArray datagram = QJsonDocument(QJsonObject{
++                {"nmx", kNmxVersion}, {"id", m_id}, {"name", m_name},
++                {"port", int(m_listener->serverPort())}, {"auth", !m_pin.isEmpty()}}).toJson(QJsonDocument::Compact);
++        QSet<QString> sent;
++        const auto send = [&](const QHostAddress& address) {
++            if (sent.contains(address.toString())) return;
++            sent.insert(address.toString());
++            m_socket->writeDatagram(datagram, address, kNmxAnnouncePort);
++        };
++        send(QHostAddress::Broadcast);
++        send(QHostAddress(QHostAddress::LocalHost));
++        for (const auto& interface : QNetworkInterface::allInterfaces()) {
++            if (!(interface.flags() & QNetworkInterface::IsUp) || !(interface.flags() & QNetworkInterface::CanBroadcast)) continue;
++            for (const auto& entry : interface.addressEntries()) {
++                if (!entry.broadcast().isNull()) send(entry.broadcast());
++            }
++        }
++    }
++
++    void accept(qintptr descriptor) {
++        if (m_stopping) {
++            QTcpSocket reject;
++            reject.setSocketDescriptor(descriptor);
++            return;
++        }
++        m_pool.start([this, descriptor] { serve(descriptor); });
++    }
++
++    // Flush everything and close properly; a QTcpSocket destroyed with queued data drops it.
++    static void finish(QTcpSocket& socket) {
++        while (socket.bytesToWrite() > 0 && socket.state() == QAbstractSocket::ConnectedState &&
++                socket.waitForBytesWritten(15000)) {
++        }
++        socket.disconnectFromHost();
++        if (socket.state() != QAbstractSocket::UnconnectedState) socket.waitForDisconnected(5000);
++    }
++
++    static void respond(QTcpSocket& socket, int status, const QByteArray& reason,
++            const QByteArray& type, const QByteArray& body) {
++        QByteArray head = "HTTP/1.1 " + QByteArray::number(status) + ' ' + reason +
++                "\r\nContent-Type: " + type + "\r\nContent-Length: " + QByteArray::number(body.size()) +
++                "\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n";
++        socket.write(head);
++        socket.write(body);
++        finish(socket);
++    }
++
++    bool authorized(const QHash<QByteArray, QByteArray>& headers, const QByteArray& path) const {
++        if (m_pin.isEmpty()) return true;
++        const QByteArray time = headers.value("x-nmx-time");
++        const QByteArray signature = headers.value("x-nmx-sig");
++        if (time.isEmpty() || signature.isEmpty()) return false;
++        const qint64 now = QDateTime::currentSecsSinceEpoch();
++        if (qAbs(now - time.toLongLong()) > 300) return false;
++        const QByteArray expected = nmxSignature(m_pin, "GET", path, time);
++        if (expected.size() != signature.size()) return false;
++        int diff = 0; // constant-time comparison
++        for (int i = 0; i < expected.size(); ++i) diff |= expected[i] ^ signature[i];
++        return diff == 0;
++    }
++
++    bool ensureSnapshot(bool force, QString* error) {
++        QMutexLocker lock(&m_catalog->mutex);
++        const qint64 now = QDateTime::currentMSecsSinceEpoch();
++        if (!force && !m_catalog->snapshot.isEmpty()) return true;
++        if (force && !m_catalog->snapshot.isEmpty() && now - m_catalog->builtAtMs < 4000) return true;
++        QByteArray file, summaries;
++        QHash<qint64, QString> audio;
++        QSet<qint64> analysis;
++        int tracks = 0;
++        if (!nmxBuildSnapshot(m_catalog->settingsPath, m_id, &file, &summaries, &audio, &analysis, &tracks, error)) return false;
++        m_catalog->snapshot = std::move(file);
++        m_catalog->summaries = std::move(summaries);
++        m_catalog->audio = std::move(audio);
++        m_catalog->analysisIds = std::move(analysis);
++        m_catalog->tracks = tracks;
++        m_catalog->builtAtMs = now;
++        return true;
++    }
++
++    void serve(qintptr descriptor) {
++        QTcpSocket socket;
++        if (!socket.setSocketDescriptor(descriptor)) return;
++        QByteArray buffer;
++        QElapsedTimer clock;
++        clock.start();
++        while (!buffer.contains("\r\n\r\n")) {
++            if (buffer.size() > 16384 || clock.elapsed() > 6000 || m_stopping) {
++                respond(socket, 400, "Bad Request", "text/plain", "bad request");
++                return;
++            }
++            if (!socket.waitForReadyRead(2000) && socket.state() != QAbstractSocket::ConnectedState) return;
++            buffer += socket.readAll();
++        }
++        const QList<QByteArray> lines = buffer.left(buffer.indexOf("\r\n\r\n")).split('\n');
++        const QList<QByteArray> request = lines.value(0).trimmed().split(' ');
++        QHash<QByteArray, QByteArray> headers;
++        for (int i = 1; i < lines.size(); ++i) {
++            const int colon = lines[i].indexOf(':');
++            if (colon > 0) headers.insert(lines[i].left(colon).trimmed().toLower(), lines[i].mid(colon + 1).trimmed());
++        }
++        if (request.size() < 2 || request[0] != "GET") {
++            respond(socket, 405, "Method Not Allowed", "text/plain", "read-only share");
++            return;
++        }
++        const QByteArray path = request[1].split('?').value(0);
++        if (!authorized(headers, path)) {
++            respond(socket, 401, "Unauthorized", "text/plain", "PIN required or wrong");
++            return;
++        }
++        const QByteArray prefix = "/nmx/v1/";
++        if (!path.startsWith(prefix)) {
++            respond(socket, 404, "Not Found", "text/plain", "not found");
++            return;
++        }
++        const QByteArray route = path.mid(prefix.size());
++        QString error;
++        if (route == "info") {
++            respond(socket, 200, "OK", "application/json", QJsonDocument(QJsonObject{
++                    {"nmx", kNmxVersion}, {"id", m_id}, {"name", m_name}, {"auth", !m_pin.isEmpty()}})
++                            .toJson(QJsonDocument::Compact));
++        } else if (route == "library" || route == "summaries") {
++            if (!ensureSnapshot(route == "library", &error)) {
++                respond(socket, 503, "Service Unavailable", "text/plain", error.toUtf8());
++                return;
++            }
++            QByteArray body;
++            {
++                QMutexLocker lock(&m_catalog->mutex);
++                body = route == "library" ? m_catalog->snapshot : m_catalog->summaries;
++            }
++            respond(socket, 200, "OK", "application/octet-stream", body);
++        } else if (route.startsWith("analysis/") || route.startsWith("audio/")) {
++            bool numeric = false;
++            const bool isAudio = route.startsWith("audio/");
++            const qint64 id = route.mid(isAudio ? 6 : 9).toLongLong(&numeric);
++            if (!numeric || id <= 0 || !ensureSnapshot(false, &error)) {
++                respond(socket, 404, "Not Found", "text/plain", "not found");
++                return;
++            }
++            QString file;
++            {
++                QMutexLocker lock(&m_catalog->mutex);
++                if (isAudio) file = m_catalog->audio.value(id);
++                else if (m_catalog->analysisIds.contains(id))
++                    file = QDir(m_catalog->settingsPath).filePath(QStringLiteral("analysis/") + QString::number(id));
++            }
++            QFile input(file);
++            if (file.isEmpty() || !input.open(QIODevice::ReadOnly)) {
++                respond(socket, 404, "Not Found", "text/plain", "not found");
++                return;
++            }
++            socket.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " +
++                    QByteArray::number(input.size()) + "\r\nConnection: close\r\n\r\n");
++            while (!input.atEnd() && !m_stopping) {
++                socket.write(input.read(256 * 1024));
++                if (!socket.waitForBytesWritten(15000)) return;
++            }
++        } else {
++            respond(socket, 404, "Not Found", "text/plain", "not found");
++        }
++        finish(socket);
++    }
++
++    std::shared_ptr<NmxCatalog> m_catalog;
++    std::unique_ptr<Listener> m_listener;
++    std::unique_ptr<QUdpSocket> m_socket;
++    std::unique_ptr<QTimer> m_timer;
++    QThreadPool m_pool;
++    QString m_id, m_name, m_pin;
++    std::atomic<bool> m_stopping{false};
++};
++
++} // namespace mixxx::network
+diff --git a/b/src/library/network/prolinkdiscovery.h b/src/library/network/prolinkdiscovery.h
+new file mode 100644
+index 0000000..ee723fd
+--- /dev/null
++++ b/src/library/network/prolinkdiscovery.h
+@@ -0,0 +1,60 @@
++#pragma once
++
++// Passive Pioneer "Pro DJ Link" discovery. CDJ/XDJ players and DJM mixers
++// broadcast a keep-alive on UDP 50000 every ~1.5 s:
++//
++//   0x00  "Qspt1WmJOL"            10-byte magic
++//   0x0a  0x06                    packet type: keep-alive
++//   0x0c  device name             20 bytes, NUL padded ("CDJ-3000", "XDJ-RX3"...)
++//   0x24  device number           1-6 players, 0x11 mixer, 0x21 rekordbox
++//   0x26  MAC address             6 bytes
++//   0x2c  IPv4 address            4 bytes
++//
++// This module only listens. It never announces itself, so it does not take a
++// player number on the Pro DJ Link network and cannot disturb a performance.
++// Reading a player's media (dbserver metadata + NFS file access) is not
++// implemented: a discovered player is listed so it is visible under NETWORK,
++// marked as not browsable.
++
++#include <QByteArray>
++#include <QHostAddress>
++#include <QString>
++#include <QStringList>
++
++#include <cstring>
++
++namespace mixxx::network {
++
++constexpr quint16 kProLinkPort = 50000;
++
++struct ProLinkDevice {
++    QString name;
++    int number{0};
++    QString mac;
++    QString host;
++    bool isPlayer() const { return number >= 1 && number <= 6; }
++};
++
++inline bool parseProLinkKeepAlive(const QByteArray& packet, ProLinkDevice* out) {
++    static const char kMagic[] = "Qspt1WmJOL";
++    if (packet.size() < 0x30 || std::memcmp(packet.constData(), kMagic, 10) != 0) return false;
++    if (quint8(packet[0x0a]) != 0x06) return false;
++    QByteArray name = packet.mid(0x0c, 20);
++    const int nul = name.indexOf('\0');
++    if (nul >= 0) name.truncate(nul);
++    const QString text = QString::fromLatin1(name).trimmed();
++    if (text.isEmpty()) return false;
++    ProLinkDevice device;
++    device.name = text;
++    device.number = quint8(packet[0x24]);
++    QStringList mac;
++    for (int i = 0; i < 6; ++i) mac.append(QStringLiteral("%1").arg(quint8(packet[0x26 + i]), 2, 16, QLatin1Char('0')));
++    device.mac = mac.join(QLatin1Char(':'));
++    device.host = QStringLiteral("%1.%2.%3.%4")
++                          .arg(quint8(packet[0x2c])).arg(quint8(packet[0x2d]))
++                          .arg(quint8(packet[0x2e])).arg(quint8(packet[0x2f]));
++    *out = device;
++    return true;
++}
++
++} // namespace mixxx::network
+diff --git a/b/src/library/network/prolinknfs.h b/src/library/network/prolinknfs.h
+new file mode 100644
+index 0000000..34ef7fc
+--- /dev/null
++++ b/src/library/network/prolinknfs.h
+@@ -0,0 +1,245 @@
++#pragma once
++
++// Read-only NFS v2 client over UDP, enough to read a Pioneer player's media
++// the way Beat Link / Crate Digger do (Pro DJ Link players export their USB/SD
++// slot as NFS shares "/C/" (USB) and "/B/" (SD)):
++//
++//   portmapper (111)  GETPORT mountd v1 / nfs v2
++//   mountd            MNT "/C/"                -> 32-byte root file handle
++//   nfs               LOOKUP, READ             -> files, chunk by chunk
++//
++// Plain ONC RPC (RFC 5531) / XDR (RFC 4506) with AUTH_UNIX credentials. Blocking;
++// call it from a worker thread only. It never writes, creates or removes anything
++// on the player. NOT validated against real CDJ/XDJ hardware (see docs).
++
++#include <QByteArray>
++#include <QDeadlineTimer>
++#include <QElapsedTimer>
++#include <QFile>
++#include <QHostAddress>
++#include <QString>
++#include <QStringList>
++#include <QUdpSocket>
++#include <QtEndian>
++
++#include <functional>
++
++namespace mixxx::network {
++
++class NfsClient {
++  public:
++    explicit NfsClient(const QString& host, int timeoutMs = 1500)
++            : m_host(host), m_timeoutMs(timeoutMs) {}
++
++    QString error() const { return m_error; }
++
++    // Resolve ports and mount `exportPath` ("/C/"). Returns false (error()) if absent.
++    bool mount(const QString& exportPath) {
++        m_mountPort = getPort(100005, 1);
++        m_nfsPort = getPort(100003, 2);
++        if (!m_mountPort || !m_nfsPort) {
++            if (m_error.isEmpty()) m_error = QStringLiteral("NFS is not offered by the player");
++            return false;
++        }
++        for (const QString& candidate : {exportPath, exportPath.endsWith(QLatin1Char('/')) ? exportPath.chopped(1) : exportPath + QLatin1Char('/')}) {
++            QByteArray args;
++            putString(args, candidate);
++            QByteArray reply;
++            if (!call(m_mountPort, 100005, 1, 1, args, &reply)) continue;
++            Reader in(reply);
++            quint32 status = 0;
++            if (!in.u32(&status) || status != 0) { m_error = QStringLiteral("mount refused (%1)").arg(status); continue; }
++            const QByteArray handle = in.fixed(32);
++            if (handle.size() != 32) { m_error = QStringLiteral("bad mount reply"); continue; }
++            m_root = handle;
++            m_error.clear();
++            return true;
++        }
++        return false;
++    }
++
++    struct Attr { bool ok{false}; quint32 type{0}; quint32 size{0}; QByteArray handle; };
++
++    // Resolve "a/b/c.ext" below the mount point.
++    Attr lookupPath(const QString& relativePath) {
++        Attr attr;
++        QByteArray handle = m_root;
++        const QStringList parts = relativePath.split(QLatin1Char('/'), Qt::SkipEmptyParts);
++        if (handle.isEmpty() || parts.isEmpty()) { m_error = QStringLiteral("not mounted"); return attr; }
++        for (const QString& part : parts) {
++            if (part == QLatin1String("..") || part == QLatin1String(".")) { m_error = QStringLiteral("bad path"); return {}; }
++            QByteArray args;
++            args.append(handle);
++            putString(args, part);
++            QByteArray reply;
++            if (!call(m_nfsPort, 100003, 2, 4, args, &reply)) return {};
++            Reader in(reply);
++            quint32 status = 0;
++            if (!in.u32(&status)) { m_error = QStringLiteral("short reply"); return {}; }
++            if (status != 0) { m_error = QStringLiteral("nfs error %1").arg(status); return {}; }
++            const QByteArray next = in.fixed(32);
++            const QByteArray fattr = in.fixed(68);
++            if (next.size() != 32 || fattr.size() != 68) { m_error = QStringLiteral("short lookup reply"); return {}; }
++            handle = next;
++            attr.type = qFromBigEndian<quint32>(fattr.constData());
++            attr.size = qFromBigEndian<quint32>(fattr.constData() + 20);
++        }
++        attr.ok = true;
++        attr.handle = handle;
++        return attr;
++    }
++
++    // Copy a file to `sink`. `progress` may abort by returning false.
++    bool readFile(const QString& relativePath, QIODevice* sink, const std::function<bool()>& keepGoing = {}) {
++        const Attr attr = lookupPath(relativePath);
++        if (!attr.ok) return false;
++        if (attr.type != 1) { m_error = QStringLiteral("not a regular file"); return false; }
++        quint32 offset = 0;
++        while (offset < attr.size) {
++            if (keepGoing && !keepGoing()) { m_error = QStringLiteral("cancelled"); return false; }
++            const quint32 want = qMin<quint32>(m_chunk, attr.size - offset);
++            QByteArray args;
++            args.append(attr.handle);
++            putU32(args, offset);
++            putU32(args, want);
++            putU32(args, want); // totalcount (unused)
++            QByteArray reply;
++            if (!call(m_nfsPort, 100003, 2, 6, args, &reply)) {
++                if (m_lastWasTimeout && m_chunk > 512) { m_chunk /= 2; continue; }
++                return false;
++            }
++            Reader in(reply);
++            quint32 status = 0;
++            if (!in.u32(&status) || status != 0) { m_error = QStringLiteral("nfs read error %1").arg(status); return false; }
++            in.fixed(68);
++            const QByteArray data = in.opaque();
++            if (data.isEmpty()) { m_error = QStringLiteral("empty read"); return false; }
++            if (sink->write(data) != data.size()) { m_error = QStringLiteral("cannot write"); return false; }
++            offset += quint32(data.size());
++        }
++        return true;
++    }
++
++  private:
++    struct Reader {
++        explicit Reader(const QByteArray& b) : data(b) {}
++        bool u32(quint32* out) {
++            if (pos + 4 > data.size()) return false;
++            *out = qFromBigEndian<quint32>(data.constData() + pos);
++            pos += 4;
++            return true;
++        }
++        QByteArray fixed(int n) {
++            if (pos + n > data.size()) { pos = data.size(); return {}; }
++            const QByteArray out = data.mid(pos, n);
++            pos += n;
++            return out;
++        }
++        QByteArray opaque() {
++            quint32 n = 0;
++            if (!u32(&n) || n > quint32(data.size() - pos)) return {};
++            const QByteArray out = data.mid(pos, int(n));
++            pos += int((n + 3) & ~3u);
++            return out;
++        }
++        const QByteArray& data;
++        int pos{0};
++    };
++    static void putU32(QByteArray& out, quint32 value) {
++        char b[4];
++        qToBigEndian(value, b);
++        out.append(b, 4);
++    }
++    static void putString(QByteArray& out, const QString& s) {
++        const QByteArray u = s.toUtf8();
++        putU32(out, quint32(u.size()));
++        out.append(u);
++        out.append(QByteArray((4 - u.size() % 4) % 4, '\0'));
++    }
++
++    quint16 getPort(quint32 program, quint32 version) {
++        QByteArray args;
++        putU32(args, program);
++        putU32(args, version);
++        putU32(args, 17); // UDP
++        putU32(args, 0);
++        QByteArray reply;
++        if (!call(111, 100000, 2, 3, args, &reply, /*unixAuth=*/false)) return 0;
++        Reader in(reply);
++        quint32 port = 0;
++        if (!in.u32(&port) || port == 0 || port > 65535) {
++            m_error = QStringLiteral("program %1 not registered").arg(program);
++            return 0;
++        }
++        return quint16(port);
++    }
++
++    // One RPC round trip with retries. `reply` receives the procedure result body.
++    bool call(quint16 port, quint32 program, quint32 version, quint32 procedure,
++            const QByteArray& args, QByteArray* reply, bool unixAuth = true) {
++        QUdpSocket socket;
++        const quint32 xid = ++m_xid;
++        QByteArray message;
++        putU32(message, xid);
++        putU32(message, 0);  // CALL
++        putU32(message, 2);  // RPC version
++        putU32(message, program);
++        putU32(message, version);
++        putU32(message, procedure);
++        if (unixAuth) {
++            QByteArray credential;
++            putU32(credential, 0);                         // stamp
++            putString(credential, QStringLiteral("nauticmixxx"));
++            putU32(credential, 0);                         // uid
++            putU32(credential, 0);                         // gid
++            putU32(credential, 0);                         // no auxiliary gids
++            putU32(message, 1);                            // AUTH_UNIX
++            putU32(message, quint32(credential.size()));
++            message.append(credential);
++        } else {
++            putU32(message, 0);
++            putU32(message, 0);
++        }
++        putU32(message, 0);  // verifier: AUTH_NULL
++        putU32(message, 0);
++        message.append(args);
++        m_lastWasTimeout = false;
++        for (int attempt = 0; attempt < 3; ++attempt) {
++            if (socket.writeDatagram(message, QHostAddress(m_host), port) != message.size()) {
++                m_error = socket.errorString();
++                return false;
++            }
++            QDeadlineTimer deadline(m_timeoutMs);
++            while (!deadline.hasExpired()) {
++                if (!socket.waitForReadyRead(int(qMax<qint64>(1, deadline.remainingTime())))) break;
++                while (socket.hasPendingDatagrams()) {
++                    const QByteArray packet = socket.receiveDatagram().data();
++                    Reader in(packet);
++                    quint32 rxid = 0, type = 0, replyStatus = 0, verifierFlavor = 0, verifierLength = 0, acceptStatus = 0;
++                    if (!in.u32(&rxid) || rxid != xid) continue;
++                    if (!in.u32(&type) || type != 1 || !in.u32(&replyStatus)) continue;
++                    if (replyStatus != 0) { m_error = QStringLiteral("rpc call denied"); return false; }
++                    if (!in.u32(&verifierFlavor) || !in.u32(&verifierLength)) continue;
++                    in.fixed(int((verifierLength + 3) & ~3u));
++                    if (!in.u32(&acceptStatus)) continue;
++                    if (acceptStatus != 0) { m_error = QStringLiteral("rpc not accepted (%1)").arg(acceptStatus); return false; }
++                    *reply = packet.mid(in.pos);
++                    return true;
++                }
++            }
++        }
++        m_lastWasTimeout = true;
++        m_error = QStringLiteral("no answer from %1:%2").arg(m_host).arg(port);
++        return false;
++    }
++
++    QString m_host, m_error;
++    int m_timeoutMs;
++    quint16 m_mountPort{0}, m_nfsPort{0};
++    QByteArray m_root;
++    quint32 m_xid{0x4e415554}; // "NAUT"
++    quint32 m_chunk{8192};
++    bool m_lastWasTimeout{false};
++};
++
++} // namespace mixxx::network
+diff --git a/src/library/rekordbox/mixmancatalog.h b/src/library/rekordbox/mixmancatalog.h
+index 875cc9b..f73a1f9 100644
+--- a/src/library/rekordbox/mixmancatalog.h
++++ b/src/library/rekordbox/mixmancatalog.h
+@@ -12,6 +12,7 @@
+ #include <QtGlobal>
+ 
+ #include "library/mixman/mixmanstick.h"
++#include "library/network/networkmanager.h"
+ #include "library/rekordbox/rekordboxdevice.h"
+ #include "library/rekordbox/rekordboxruntimecatalog.h"
+ #include "track/beats.h"
+@@ -172,7 +173,7 @@ inline bool populateMixman(const QString& root, const mixman::Stick& stick,
+         track.resolvedAudioPath = resolvePath(root, source.relativePath, false);
+         if (track.resolvedAudioPath.isEmpty()) {
+             track.diagnostics.append(QStringLiteral("Unsafe or unresolvable export path: %1").arg(source.relativePath));
+-        } else if (!QFileInfo::exists(track.resolvedAudioPath)) {
++        } else if (!QFileInfo::exists(track.resolvedAudioPath) && !network::NetworkManager::isNetworkRoot(root)) {
+             track.diagnostics.append(QStringLiteral("Export file is missing: %1").arg(source.relativePath));
+         }
+         track.cues = mixmanRuntimeCues(source.cues, source.mainCue, source.samplerate > 0 ? source.samplerate : 44100);
+@@ -229,6 +230,11 @@ inline bool populateMixman(const QString& root, const mixman::Stick& stick,
+ inline ConstWaveformPointer loadMixmanWaveform(const QString& root, const QJsonObject& raw, const QString& prefix) {
+     const qint64 id = qint64(raw.value(prefix + QStringLiteral("id")).toDouble(-1));
+     if (id < 0) return {};
++    if (network::NetworkManager::isNetworkRoot(root) && !QFileInfo::exists(mixman::analysisFilePath(root, id))) {
++        if (auto* manager = network::NetworkManager::instance()) {
++            manager->ensureFile(root, QStringLiteral("MIXMAN/analysis/") + QString::number(id));
++        }
++    }
+     QFile file(mixman::analysisFilePath(root, id));
+     if (!file.open(QIODevice::ReadOnly) || file.size() > 64 * 1024 * 1024) return {};
+     const QByteArray compressed = file.readAll();
+diff --git a/src/library/rekordbox/rekordboxdevice.cpp b/src/library/rekordbox/rekordboxdevice.cpp
+index aa257ea..7c13af0 100644
+--- a/src/library/rekordbox/rekordboxdevice.cpp
++++ b/src/library/rekordbox/rekordboxdevice.cpp
+@@ -1,6 +1,7 @@
+ #include "library/rekordbox/rekordboxdevice.h"
+ #include "util/rx3usbstorage.h"
+ #include "library/mixman/mixmanstick.h"
++#include "library/serato/seratostick.h"
+ 
+ #include <QCryptographicHash>
+ #include <QDateTime>
+@@ -114,6 +115,13 @@ QString databasePath(const QString& root) {
+             return path;
+         }
+     }
++    // A Serato drive: _Serato_/database V2 is fingerprinted the same way.
++    if (!mixxx::seratostick::databasePath(root).isEmpty()) {
++        const auto path = resolvePath(root, QStringLiteral("_Serato_/database V2"));
++        if (!path.isEmpty()) {
++            return path;
++        }
++    }
+     return {};
+ }
+ 
+diff --git a/src/library/rekordbox/rekordboxfeature.cpp b/src/library/rekordbox/rekordboxfeature.cpp
+index a13b3ca..3d758b5 100644
+--- a/src/library/rekordbox/rekordboxfeature.cpp
++++ b/src/library/rekordbox/rekordboxfeature.cpp
+@@ -1,5 +1,6 @@
+ #include "library/rekordbox/rekordboxperformancewriter.h"
+ #include "library/rekordbox/rekordboxfeature.h"
++#include "library/network/networkmanager.h"
+ #include "library/rekordbox/mixmancatalog.h"
+ 
+ #include <algorithm>
+@@ -76,6 +77,12 @@ QList<mixxx::rekordbox::DiscoveredDevice> findRekordboxDevices(
+     for (const auto& path : manuallyAuthorizedDevicePaths) {
+         devices.append(QFileInfo(path));
+     }
++    // Libraries of other NauticMixxx instances, cached like a stick under the profile.
++    if (auto* network = mixxx::network::NetworkManager::instance()) {
++        for (const auto& path : network->readyRoots()) {
++            devices.append(QFileInfo(path));
++        }
++    }
+ 
+     QList<mixxx::rekordbox::DiscoveredDevice> found;
+     QSet<QString> seen;
+@@ -92,9 +99,14 @@ QList<mixxx::rekordbox::DiscoveredDevice> findRekordboxDevices(
+             qWarning() << "Cannot read Rekordbox source" << device.absoluteFilePath()
+                        << snapshot.error;
+         }
+-        const auto label = device.fileName().isEmpty()
++        QString label = device.fileName().isEmpty()
+                 ? device.absoluteFilePath()
+                 : device.fileName();
++        if (auto* network = mixxx::network::NetworkManager::instance()) {
++            if (const auto source = network->sourceForRoot(device.absoluteFilePath())) {
++                label = source->name;
++            }
++        }
+         found.append({label, std::move(snapshot)});
+     }
+     return found;
+@@ -157,10 +169,17 @@ RekordboxFeature::RekordboxFeature(
+         checkMountedVolumes();
+         m_mountTimer.start();
+     });
++    m_pNetwork = new mixxx::network::NetworkManager(pConfig, this);
++    m_pNetwork->setChangedCallback([this] { startDiscovery(); });
++    QTimer::singleShot(0, this, [this] { m_pNetwork->start(); });
+ }
+ 
+ RekordboxFeature::~RekordboxFeature() {
+     m_mountTimer.stop();
++    if (m_pNetwork) {
++        m_pNetwork->setChangedCallback({});
++        m_pNetwork->stop();
++    }
+     if (m_loadingSession) {
+         m_loadingSession->invalidate();
+     }
+diff --git a/src/library/rekordbox/rekordboxfeature.h b/src/library/rekordbox/rekordboxfeature.h
+index 164d5d7..441d687 100644
+--- a/src/library/rekordbox/rekordboxfeature.h
++++ b/src/library/rekordbox/rekordboxfeature.h
+@@ -14,6 +14,7 @@
+ #include <functional>
+ 
+ #include "library/libraryfeature.h"
++#include "library/network/networkmanager.h"
+ #include "library/proxytrackmodel.h"
+ #include "library/rekordbox/rekordboxdevice.h"
+ #include "library/rekordbox/rekordboxruntimetrackmodel.h"
+@@ -51,6 +52,8 @@ class RekordboxFeature final : public LibraryFeature {
+             const QList<quint32>& ids,
+             const QString& viewKey);
+ 
++    mixxx::network::NetworkManager* networkManager() const { return m_pNetwork; }
++
+   public slots:
+     void activate() override;
+     void activateChild(const QModelIndex& index) override;
+@@ -59,6 +62,7 @@ class RekordboxFeature final : public LibraryFeature {
+     void onTracksFound();
+ 
+   private:
++    mixxx::network::NetworkManager* m_pNetwork = nullptr;
+     int m_pendingRatingWrites=0;
+     bool m_discoveryOverlappedWrite=false;
+     void checkMountedVolumes();
+diff --git a/src/library/rekordbox/rekordboxusbsession.cpp b/src/library/rekordbox/rekordboxusbsession.cpp
+index 40d862a..2dbb76f 100644
+--- a/src/library/rekordbox/rekordboxusbsession.cpp
++++ b/src/library/rekordbox/rekordboxusbsession.cpp
+@@ -17,6 +17,8 @@
+ #include "library/rekordbox/rekordboxplaylistwriter.h"
+ #include "library/rekordbox/rekordboxtrackadapter.h"
+ #include "library/rekordbox/mixmancatalog.h"
++#include "library/network/networkmanager.h"
++#include "library/serato/seratostick.h"
+ 
+ namespace mixxx::rekordbox {
+ namespace {
+@@ -282,7 +284,7 @@ RekordboxUsbSession::~RekordboxUsbSession() {
+ }
+ 
+ QString RekordboxUsbSession::writeList(const QString& name, const QList<quint32>& ids, bool history) {
+-    if (m_mixman) return QStringLiteral("MIXMAN sticks are read-only.");
++    if (m_mixman || m_serato) return QStringLiteral("This source is read-only.");
+     const std::lock_guard<std::mutex> lock(m_mutex);
+     if (m_state != UsbSessionState::Ready || !m_catalog || !m_sessionState->isActive()) return "USB session is unavailable.";
+     quint32 id = 0; const auto error = writeUsbList(&m_snapshot, name, ids, history, &id);
+@@ -294,7 +296,7 @@ QString RekordboxUsbSession::writeList(const QString& name, const QList<quint32>
+ }
+ 
+ QString RekordboxUsbSession::writePerformance(const PerformanceEdit& edit) {
+-    if (m_mixman) return QStringLiteral("MIXMAN sticks are read-only.");
++    if (m_mixman || m_serato) return QStringLiteral("This source is read-only.");
+     const std::lock_guard<std::mutex> lock(m_mutex);
+     if (m_state != UsbSessionState::Ready || !m_catalog || !m_sessionState->isActive()) return "USB session is unavailable.";
+     auto track = m_catalog->findTrack(edit.trackId);
+@@ -309,6 +311,7 @@ QString RekordboxUsbSession::writePerformance(const PerformanceEdit& edit) {
+ 
+ QString RekordboxUsbSession::writeMixman(const mixman::Edit& edit) {
+     if (!m_mixman) return QStringLiteral("Not a MIXMAN stick.");
++    if (network::NetworkManager::isNetworkRoot(m_root)) return QStringLiteral("Network sources are read-only.");
+     const std::lock_guard<std::mutex> lock(m_mutex);
+     if (m_state != UsbSessionState::Ready || !m_catalog || !m_sessionState->isActive()) return QStringLiteral("USB session is unavailable.");
+     const auto track = m_catalog->findTrack(quint32(edit.trackId));
+@@ -329,6 +332,7 @@ QString RekordboxUsbSession::writeMixman(const mixman::Edit& edit) {
+ }
+ 
+ QString RekordboxUsbSession::writeRating(quint32 trackId,int rating) {
++    if (m_serato) return QStringLiteral("Serato drives are read-only.");
+     if (m_mixman) {
+         mixman::Edit edit;
+         edit.trackId = trackId;
+@@ -381,7 +385,9 @@ bool RekordboxUsbSession::load() {
+         recognized |= QFileInfo::exists(QDir(root).filePath(name));
+     }
+     const bool mixman = mixxx::mixman::isMixmanStick(root);
+-    if (!recognized && !mixman) {
++    const bool serato = !mixman && !mixxx::mixman::hasRekordboxExport(root) &&
++            !mixxx::seratostick::databasePath(root).isEmpty();
++    if (!recognized && !mixman && !serato) {
+         return fail(UsbSessionState::Error, UsbSessionError::NotRekordbox, QStringLiteral("No Rekordbox structure"));
+     }
+     protectRoot(root);
+@@ -390,7 +396,7 @@ bool RekordboxUsbSession::load() {
+     const auto canonicalRoot = volume.canonicalFilePath();
+     for (const auto& relative : {QStringLiteral("PIONEER"), QStringLiteral(".PIONEER"),
+                  QStringLiteral("PIONEER/rekordbox"), QStringLiteral(".PIONEER/rekordbox"),
+-                 QStringLiteral("MIXMAN")}) {
++                 QStringLiteral("MIXMAN"), QStringLiteral("_Serato_")}) {
+         const QFileInfo directory(QDir(root).filePath(relative));
+         const auto canonical = directory.canonicalFilePath();
+         if (directory.isDir() && canonical.startsWith(canonicalRoot + '/') &&
+@@ -415,14 +421,16 @@ bool RekordboxUsbSession::load() {
+     QByteArray databaseBytes;
+     auto catalog = std::make_shared<RuntimeCatalog>();
+     QString error;
+-    if (mixman) {
++    if (mixman || serato) {
+         QFile database(path);
+         if (!database.open(QIODevice::ReadOnly)) {
+             return fail(UsbSessionState::Unreadable, UsbSessionError::UnreadableDevice, database.errorString());
+         }
+         databaseBytes = database.readAll();
+         mixxx::mixman::Stick stick;
+-        if (!mixxx::mixman::read(root, &stick, &error)) {
++        const bool readOk = serato ? mixxx::seratostick::read(root, &stick, &error)
++                                   : mixxx::mixman::read(root, &stick, &error);
++        if (!readOk) {
+             return fail(UsbSessionState::Error, UsbSessionError::CorruptExport, error);
+         }
+         if (!populateMixman(root, stick, catalog.get(), &error)) {
+@@ -456,6 +464,7 @@ bool RekordboxUsbSession::load() {
+     }
+     m_snapshot = snapshot;
+     m_mixman = mixman;
++    m_serato = serato;
+     m_catalog = std::move(catalog);
+     m_extendedDatabasePath = extended;
+     m_state = UsbSessionState::Ready;
+@@ -717,6 +726,15 @@ TrackPointer RekordboxUsbSession::createTemporaryTrack(
+                        << rekordboxId << waveformError;
+         }
+     }
++    if (network::NetworkManager::isNetworkRoot(m_root) && !runtimeTrack->audioRelativePath.isEmpty()) {
++        // The audio of a network source is copied to the local cache when it is first needed.
++        QString fetchError;
++        if (auto* manager = network::NetworkManager::instance();
++                !manager || !manager->ensureFile(m_root, runtimeTrack->audioRelativePath, &fetchError)) {
++            if (error) *error = fetchError.isEmpty() ? QStringLiteral("Cannot fetch the track from the network") : fetchError;
++            return {};
++        }
++    }
+     auto projected = RekordboxTrackAdapter::createTemporaryTrack(
+             *runtimeTrack, sessionState, std::move(loadedWaveforms), error);
+     if (projected && isMixmanTrack(*runtimeTrack)) {
+diff --git a/src/library/rekordbox/rekordboxusbsession.h b/src/library/rekordbox/rekordboxusbsession.h
+index d115006..5595fd5 100644
+--- a/src/library/rekordbox/rekordboxusbsession.h
++++ b/src/library/rekordbox/rekordboxusbsession.h
+@@ -47,6 +47,7 @@ class RekordboxUsbSession final {
+     void invalidate();
+     QString root() const {return m_root;}
+     bool isMixman() const {return m_mixman;}
++    bool isSerato() const {return m_serato;}
+     DeviceSnapshot deviceSnapshot() const;
+     UsbSessionState state() const;
+     UsbSessionError errorCode() const;
+@@ -76,6 +77,7 @@ class RekordboxUsbSession final {
+     QString m_error;
+     bool m_attempted{false};
+     bool m_mixman{false};
++    bool m_serato{false};
+ };
+ 
+ } // namespace mixxx::rekordbox
+diff --git a/b/src/library/serato/seratostick.h b/src/library/serato/seratostick.h
+new file mode 100644
+index 0000000..edc6494
+--- /dev/null
++++ b/src/library/serato/seratostick.h
+@@ -0,0 +1,185 @@
++#pragma once
++
++// Serato USB drives as a SOURCE (read-only). A drive written by Serato DJ holds
++//
++//   <drive>/_Serato_/database V2        chunked big-endian records, UTF-16BE text
++//   <drive>/_Serato_/Subcrates/*.crate  one crate per file ("Parent%%Child" nests)
++//
++// Track paths are stored relative to the drive root. The reader produces the same
++// plain-data `mixman::Stick` the MIXMAN reader does, so the existing runtime
++// catalog, browse categories and deck loading serve both. Cue points and grids
++// live inside the audio files' tags (Serato Markers2 / BeatGrid) and are read
++// by Mixxx's own tag import when a track is loaded; this reader only supplies
++// the library view (tags, key, BPM, crates).
++
++#include <QByteArray>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QHash>
++#include <QSet>
++#include <QString>
++#include <QtEndian>
++
++#include <cstring>
++
++#include "library/mixman/mixmanstick.h"
++
++namespace mixxx::seratostick {
++
++constexpr qint64 kMaxDatabaseBytes = Q_INT64_C(512) << 20;
++constexpr qint64 kMaxCrateBytes = Q_INT64_C(64) << 20;
++
++inline QString databasePath(const QString& root) {
++    if (root.isEmpty()) return {};
++    const QString candidate = QDir(root).filePath(QStringLiteral("_Serato_/database V2"));
++    const QFileInfo info(candidate);
++    if (!info.isFile() || info.isSymLink()) return {};
++    const QString canonicalRoot = QFileInfo(root).canonicalFilePath();
++    const QString canonical = info.canonicalFilePath();
++    if (canonicalRoot.isEmpty() || !canonical.startsWith(canonicalRoot + QLatin1Char('/'))) return {};
++    return candidate;
++}
++
++namespace detail {
++
++inline QString utf16be(const QByteArray& data) {
++    QString text;
++    text.reserve(data.size() / 2);
++    for (int i = 0; i + 1 < data.size(); i += 2) {
++        text.append(QChar(quint16((quint8(data[i]) << 8) | quint8(data[i + 1]))));
++    }
++    return text;
++}
++
++constexpr quint32 tag(const char (&name)[5]) {
++    return (quint32(quint8(name[0])) << 24) | (quint32(quint8(name[1])) << 16) |
++            (quint32(quint8(name[2])) << 8) | quint32(quint8(name[3]));
++}
++
++// Walk the records of a chunk; `visit(id, payload)` returns false to stop.
++template<typename Visit>
++inline bool forEachRecord(const QByteArray& data, Visit&& visit) {
++    qint64 offset = 0;
++    while (offset + 8 <= data.size()) {
++        const quint32 id = qFromBigEndian<quint32>(data.constData() + offset);
++        const quint32 length = qFromBigEndian<quint32>(data.constData() + offset + 4);
++        offset += 8;
++        if (qint64(length) > data.size() - offset) return false; // truncated record
++        if (!visit(id, QByteArray::fromRawData(data.constData() + offset, int(length)))) return true;
++        offset += length;
++    }
++    return offset == data.size();
++}
++
++inline QString cleanPath(QString path) {
++    path.replace(QLatin1Char('\\'), QLatin1Char('/'));
++    while (path.startsWith(QLatin1Char('/'))) path.remove(0, 1);
++    return path;
++}
++
++// Serato writes lengths as "mm:ss.cc" text.
++inline double parseLength(const QString& text) {
++    const QString trimmed = text.trimmed();
++    if (trimmed.isEmpty()) return 0;
++    if (!trimmed.contains(QLatin1Char(':'))) return trimmed.toDouble();
++    double seconds = 0;
++    for (const QString& part : trimmed.split(QLatin1Char(':'))) seconds = seconds * 60 + part.toDouble();
++    return seconds;
++}
++
++} // namespace detail
++
++inline bool read(const QString& root, mixman::Stick* stick, QString* error) {
++    const QString path = databasePath(root);
++    if (path.isEmpty()) {
++        if (error) *error = QStringLiteral("No Serato database found");
++        return false;
++    }
++    QFile file(path);
++    if (!file.open(QIODevice::ReadOnly) || file.size() > kMaxDatabaseBytes) {
++        if (error) *error = QStringLiteral("Cannot read the Serato database");
++        return false;
++    }
++    const QByteArray data = file.readAll();
++    stick->root = root;
++    stick->databasePath = path;
++    stick->exportId = QStringLiteral("serato");
++    stick->createdUnix = QFileInfo(path).lastModified().toSecsSinceEpoch();
++
++    QHash<QString, qint64> byPath;      // exact relative path -> id
++    QHash<QString, qint64> byLowerPath; // case-insensitive fallback (FAT/exFAT drives)
++    qint64 nextId = 1;
++    const bool wellFormed = detail::forEachRecord(data, [&](quint32 id, const QByteArray& payload) {
++        if (id != detail::tag("otrk")) return true;
++        mixman::Track track;
++        bool missing = false;
++        detail::forEachRecord(payload, [&](quint32 field, const QByteArray& value) {
++            const auto text = [&] { return detail::utf16be(value); };
++            switch (field) {
++            case detail::tag("pfil"): track.relativePath = detail::cleanPath(text()); break;
++            case detail::tag("tsng"): track.title = text(); break;
++            case detail::tag("tart"): track.artist = text(); break;
++            case detail::tag("talb"): track.album = text(); break;
++            case detail::tag("tgen"): track.genre = text(); break;
++            case detail::tag("tcom"): track.comment = text(); break;
++            case detail::tag("tgrp"): track.grouping = text(); break;
++            case detail::tag("ttyr"): track.year = text().trimmed(); break;
++            case detail::tag("tkey"): track.key = text().trimmed(); break;
++            case detail::tag("tbpm"): track.bpm = text().trimmed().toDouble(); break;
++            case detail::tag("tlen"): track.duration = detail::parseLength(text()); break;
++            case detail::tag("tsmp"): track.samplerate = int(text().trimmed().toDouble()); break;
++            case detail::tag("bbgl"): track.bpmLocked = !value.isEmpty() && value.at(0) != 0; break;
++            case detail::tag("bmis"): missing = value.size() == 1 && value.at(0) != 0; break;
++            default: break;
++            }
++            return true;
++        });
++        if (track.relativePath.isEmpty() || track.relativePath.contains(QStringLiteral(".."))) return true;
++        // Serato keeps entries for files it cannot find; they cannot be played.
++        if (missing && !QFileInfo::exists(QDir(root).filePath(track.relativePath))) return true;
++        if (track.title.isEmpty()) track.title = QFileInfo(track.relativePath).completeBaseName();
++        track.id = nextId++;
++        byPath.insert(track.relativePath, track.id);
++        byLowerPath.insert(track.relativePath.toLower(), track.id);
++        stick->tracks.append(std::move(track));
++        return true;
++    });
++    if (!wellFormed && stick->tracks.isEmpty()) {
++        if (error) *error = QStringLiteral("The Serato database is damaged");
++        return false;
++    }
++
++    // Crates: "Techno%%Peak.crate" is "Techno / Peak".
++    const QDir crateDir(QDir(root).filePath(QStringLiteral("_Serato_/Subcrates")));
++    qint64 crateId = 1;
++    for (const QFileInfo& entry : crateDir.entryInfoList({QStringLiteral("*.crate")}, QDir::Files, QDir::Name | QDir::IgnoreCase)) {
++        if (entry.isSymLink() || entry.size() > kMaxCrateBytes) continue;
++        QFile crateFile(entry.absoluteFilePath());
++        if (!crateFile.open(QIODevice::ReadOnly)) continue;
++        const QByteArray crateData = crateFile.readAll();
++        mixman::List list;
++        QSet<qint64> members;
++        list.id = crateId++;
++        list.name = entry.completeBaseName().replace(QStringLiteral("%%"), QStringLiteral(" / "));
++        detail::forEachRecord(crateData, [&](quint32 id, const QByteArray& payload) {
++            if (id != detail::tag("otrk")) return true;
++            detail::forEachRecord(payload, [&](quint32 field, const QByteArray& value) {
++                if (field != detail::tag("ptrk")) return true;
++                const QString relative = detail::cleanPath(detail::utf16be(value));
++                qint64 trackId = byPath.value(relative, 0);
++                if (trackId == 0) trackId = byLowerPath.value(relative.toLower(), 0);
++                if (trackId != 0 && !members.contains(trackId)) {
++                    members.insert(trackId);
++                    list.trackIds.append(trackId);
++                }
++                return true;
++            });
++            return true;
++        });
++        stick->crates.append(std::move(list));
++    }
++    return true;
++}
++
++} // namespace mixxx::seratostick
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index 48da81b..389a636 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -379,7 +379,12 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         });
+     }
+     ~WRx3Browser() override = default;
+-    QString infoUsbName(const QString& root) const {return QString("USB%1").arg(m_usbSlots.value(root));}
++    static bool isNetworkRoot(const QString& root) {return mixxx::network::NetworkManager::isNetworkRoot(root);}
++    // "USB1"/"USB2" for sticks, "NET" for a library read over the network.
++    QString sourceName(const QString& root) const {
++        return isNetworkRoot(root)?QStringLiteral("NET"):QString("USB%1").arg(m_usbSlots.value(root));
++    }
++    QString infoUsbName(const QString& root) const {return sourceName(root);}
+     // Source readout for a loaded deck: the USB slot that holds the file, or
+     // STORAGE for the local Mixxx library.
+     QString deckSourceName(const QString& location) const {
+@@ -394,6 +399,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+             }
+         }
+         if(root.isEmpty()) return QStringLiteral("STORAGE");
++        if(isNetworkRoot(root)) return QStringLiteral("NET");
+         const int slot=m_usbSlots.value(root);
+         return slot>0?QString("USB%1").arg(slot):QStringLiteral("USB");
+     }
+@@ -1071,7 +1077,8 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_keyboard->hide();m_search->hide();m_categories->show();m_searchRail->hide();m_breadcrumb->show();m_searchCount->hide();
+         m_source->setText("SOURCE");
+         m_sourceDetails->setCurrentWidget(m_info);m_settingsRoot.clear();m_sourceActionIndex=-1;
+-        m_pages->setCurrentIndex(1);m_breadcrumb->setText("SOURCE");m_focus=NavigationTarget::Source;
++        m_netView=!m_storageMode && isNetworkRoot(m_currentRoot);
++        m_pages->setCurrentIndex(1);m_breadcrumb->setText(m_netView?"SOURCE / NETWORK":"SOURCE");m_focus=NavigationTarget::Source;
+         refreshSources();
+         updateSourceActionHighlight();updateSourceAppearance();
+         m_sources->setFocus();
+@@ -1197,7 +1204,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         const auto root=m_pages->currentIndex()==1?deviceRoot(sourceDeviceForNavigation()):m_currentRoot;
+         const auto color=rx3::sourceColor(rx3::readSourceColor(root)).name();
+         const bool storageShown=m_storageMode && m_pages->currentIndex()==0;
+-        m_sourceLabel->setText(storageShown?QStringLiteral("STORAGE"):QString("USB%1").arg(m_usbSlots.value(root)));
++        m_sourceLabel->setText(storageShown?QStringLiteral("STORAGE"):sourceName(root));
+         m_sourceLabel->setStyleSheet(rx3ui::qss(QString(storageShown?QStringLiteral("background:#303030;color:white;padding:8px;font-size:16px;"):
+                 "background:"+color+";color:white;padding:8px;font-size:16px;")));
+         m_sourceLabel->setVisible(m_pages->currentIndex()!=1 && m_pages->currentWidget()!=m_tools &&
+@@ -1227,6 +1234,68 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         }
+     }
+     static inline const QString kStorageRoot=QStringLiteral("rx3:storage");
++    static inline const QString kNetworkRoot=QStringLiteral("rx3:network");
++    static inline const QString kNetBackRoot=QStringLiteral("rx3:netback");
++    bool isNetworkRow(int row) const {
++        auto* item=m_sources->topLevelItem(row);
++        return item && item->data(0,Qt::UserRole).toString()==kNetworkRoot;
++    }
++    bool isNetBackRow(int row) const {
++        auto* item=m_sources->topLevelItem(row);
++        return item && item->data(0,Qt::UserRole).toString()==kNetBackRoot;
++    }
++    mixxx::network::NetworkManager* networkManager() const {
++        auto* feature=m_backend?m_backend->rekordboxFeature():nullptr;
++        return feature?feature->networkManager():nullptr;
++    }
++    // SOURCE > NETWORK: one list for both protocols. Row 0 returns to SOURCE;
++    // a library that is ready opens like a USB, the others show why not.
++    void refreshNetworkSources(const QString& previousRoot) {
++        QHash<QString,QPersistentModelIndex> byRoot;
++        for(int i=0;i<model()->rowCount();++i) {
++            const auto feature=model()->index(i,0);
++            if(feature.data(SidebarModel::IconNameRole).toString()!="rekordbox") continue;
++            for(int r=0;r<model()->rowCount(feature);++r) {
++                const auto device=model()->index(r,0,feature);
++                if(isNetworkRoot(deviceRoot(device))) byRoot.insert(deviceRoot(device),device);
++            }
++        }
++        auto* back=new QTreeWidgetItem(m_sources,{"◂   BACK TO SOURCE"});
++        back->setData(0,Qt::UserRole,kNetBackRoot);
++        back->setData(0,Qt::UserRole+2,QStringLiteral("◂"));
++        back->setData(0,Qt::UserRole+3,QString());
++        back->setData(0,Qt::UserRole+4,QStringLiteral("BACK TO SOURCE"));
++        m_devices.push_back(QPersistentModelIndex());
++        int selected=0;
++        auto* manager=networkManager();
++        auto sources=manager?manager->sources():QList<mixxx::network::NetSource>();
++        std::sort(sources.begin(),sources.end(),[](const auto& a,const auto& b) {
++            if(a.protocol!=b.protocol) return a.protocol<b.protocol;
++            return a.name.compare(b.name,Qt::CaseInsensitive)<0;
++        });
++        for(const auto& source:sources) {
++            const auto device=byRoot.value(source.root);
++            const bool nautic=source.protocol==mixxx::network::Protocol::Nautic;
++            const QString status=device.isValid() && deviceReady(device)?QStringLiteral("›"):
++                    source.state=="error"?QStringLiteral("ERROR"):
++                    source.state=="unsupported"?QStringLiteral("NOT BROWSABLE"):QStringLiteral("READING…");
++            auto* item=new QTreeWidgetItem(m_sources,{source.name});
++            item->setData(0,Qt::UserRole,source.root.isEmpty()?QStringLiteral("rx3:net:")+source.key:source.root);
++            item->setData(0,Qt::UserRole+2,nautic?QStringLiteral("NET"):QStringLiteral("DJL"));
++            item->setData(0,Qt::UserRole+3,status);
++            item->setData(0,Qt::UserRole+4,QString((nautic?QStringLiteral("NAUTICMIXXX  "):QStringLiteral("PIONEER  "))+source.name));
++            item->setData(0,Qt::UserRole+5,source.key);
++            m_devices.push_back(device);
++            if(item->data(0,Qt::UserRole).toString()==previousRoot) selected=m_sources->topLevelItemCount()-1;
++        }
++        if(sources.isEmpty()) {
++            auto* empty=new QTreeWidgetItem(m_sources,{"NO NETWORK LIBRARY FOUND"});
++            empty->setFlags(Qt::NoItemFlags);
++            m_devices.push_back(QPersistentModelIndex());
++        }
++        m_sources->setCurrentItem(m_sources->topLevelItem(selected));
++        updateSourceInfo(selected);
++    }
+     bool isStorageRow(int row) const {
+         auto* item=m_sources->topLevelItem(row);
+         return item && item->data(0,Qt::UserRole).toString()==kStorageRoot;
+@@ -1238,6 +1307,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         const QString previousRoot=m_sources->currentItem()
+                 ? m_sources->currentItem()->data(0,Qt::UserRole).toString() : QString();
+         m_sources->clear();m_devices.clear();
++        if(m_netView) {refreshNetworkSources(previousRoot);m_refreshingSources=false;return;}
+         // Enumerate current feature indexes, since a provider may have reset
+         // its child model during discovery.
+         for(int i=0;i<model()->rowCount();++i) {
+@@ -1245,6 +1315,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+             if(root.data(SidebarModel::IconNameRole).toString()!="rekordbox") continue;
+             for(int r=0;r<model()->rowCount(root);++r) {
+                 const auto device=model()->index(r,0,root);
++                if(isNetworkRoot(deviceRoot(device))) continue; // listed under NETWORK
+                 const QString suffix=deviceReady(device) ? QStringLiteral("  ›")
+                         : deviceStatus(device)=="error" ? QStringLiteral("  ·  ERROR")
+                         : QStringLiteral("  ·  READING…");
+@@ -1253,7 +1324,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+                 m_devices.push_back(device);
+             }
+         }
+-        const int storageRow=m_sources->topLevelItemCount()+(m_devices.empty()?1:0);
++        const int storageRow=m_sources->topLevelItemCount()+(m_devices.empty()?1:0)+1; // after NETWORK
+         int selected=qMin(previous,storageRow);
+         for(int row=0;row<m_sources->topLevelItemCount();++row)
+             if(m_sources->topLevelItem(row)->data(0,Qt::UserRole).toString()==previousRoot) {selected=row;break;}
+@@ -1280,6 +1351,12 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+             auto* empty=new QTreeWidgetItem(m_sources,{"NO DEVICE"});
+             empty->setFlags(Qt::NoItemFlags);
+         }
++        // NETWORK: libraries of other NauticMixxx instances and Pioneer players.
++        auto* network=new QTreeWidgetItem(m_sources,{"▣   NETWORK   ›"});
++        network->setData(0,Qt::UserRole,kNetworkRoot);
++        network->setData(0,Qt::UserRole+2,QStringLiteral("NET"));
++        network->setData(0,Qt::UserRole+3,QStringLiteral("›"));
++        network->setData(0,Qt::UserRole+4,QStringLiteral("NETWORK"));
+         // STORAGE is the Mixxx library on the machine running NauticMixxx.
+         // It is always listed, after the removable USB devices.
+         auto* storage=new QTreeWidgetItem(m_sources,{"▣   STORAGE   ›"});
+@@ -1287,7 +1364,8 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         storage->setData(0,Qt::UserRole+2,QStringLiteral("INT"));
+         storage->setData(0,Qt::UserRole+3,QStringLiteral("›"));
+         storage->setData(0,Qt::UserRole+4,QStringLiteral("STORAGE"));
+-        if(m_devices.empty()) selected=storageRow;
++        if(previousRoot==kNetworkRoot) selected=storageRow-1;
++        if(m_devices.empty() && previousRoot!=kNetworkRoot) selected=storageRow;
+         m_sources->setCurrentItem(m_sources->topLevelItem(selected));
+         m_refreshingSources=false;
+         updateSourceInfo(selected);
+@@ -1298,7 +1376,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         if(row>=0 && row<int(m_devices.size()) && deviceReady(m_devices[row])) {
+             const auto root=deviceRoot(m_devices[row]);
+             qApp->setProperty("rx3SettingsUsbRoot",root);
+-            qApp->setProperty("rx3SettingsUsbName",QString("USB%1").arg(m_usbSlots.value(root)));
++            qApp->setProperty("rx3SettingsUsbName",sourceName(root));
+             qApp->setProperty("rx3SettingsUsbDeviceName",m_devices[row].data(Qt::DisplayRole).toString());
+         } else qApp->setProperty("rx3SettingsUsbRoot",QString());
+         if(m_refreshingSources) return;
+@@ -1604,6 +1682,12 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     void chooseSource() {
+         const int row=m_sources->indexOfTopLevelItem(m_sources->currentItem());
+         if(isStorageRow(row)) {chooseStorage();return;}
++        if(isNetworkRow(row)) {
++            m_netView=true;m_breadcrumb->setText("SOURCE / NETWORK");refreshSources();return;
++        }
++        if(isNetBackRow(row)) {
++            m_netView=false;m_breadcrumb->setText("SOURCE");refreshSources();return;
++        }
+         if(row<0 || row>=int(m_devices.size())) return;
+         const QModelIndex device=m_devices[row];
+         if(!deviceReady(device)) {updateSourceInfo(row);return;}
+@@ -1611,7 +1695,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_selectedDevice=device;
+         m_currentRoot=deviceRoot(m_selectedDevice);
+         qApp->setProperty("rx3SettingsUsbRoot",m_currentRoot);
+-        qApp->setProperty("rx3SettingsUsbName",QString("USB%1").arg(m_usbSlots.value(m_currentRoot)));
++        qApp->setProperty("rx3SettingsUsbName",sourceName(m_currentRoot));
+         qApp->setProperty("rx3SettingsUsbDeviceName",m_selectedDevice.data(Qt::DisplayRole).toString());
+         m_pages->setCurrentIndex(0);
+         m_source->setText("SOURCE");m_facets->hide();m_sidebar->hide();
+@@ -1819,6 +1903,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     bool m_searchHasAllTracks=false;
+     int m_searchReturnCategory=0;
+     QMap<QString,int> m_usbSlots;
++    bool m_netView=false;
+     QMap<QString,QString> m_folderPaths;
+     QString m_folderPath;
+     QString m_pendingFolderTrack;
+diff --git a/src/widget/wrx3browsermixman.h b/src/widget/wrx3browsermixman.h
+index 179d9d8..7773d98 100644
+--- a/src/widget/wrx3browsermixman.h
++++ b/src/widget/wrx3browsermixman.h
+@@ -9,6 +9,8 @@
+ 
+ #include "analyzer/analyzerscheduledtrack.h"
+ #include "library/mixman/mixmanstick.h"
++#include "library/network/networkmanager.h"
++#include <QtConcurrentRun>
+ #include "library/rekordbox/rekordboxdevice.h"
+ #include "track/beats.h"
+ #include "track/track.h"
+@@ -63,7 +65,7 @@ inline void WRx3Browser::showMixmanImport(const QString& root,std::function<void
+         return QString("%1 tracks, %2 crates, %3 playlists").arg(job->stick.tracks.size()).arg(job->stick.crates.size()).arg(job->stick.playlists.size());
+     };
+     // One step: copy one track's audio, add it to the library, apply its stick data.
+-    const auto step=[guard,job]() {
++    const auto apply=[guard,job]() {
+         if(!guard) return;
+         auto* self=guard.data();
+         auto* manager=self->m_backend?self->m_backend->trackCollectionManager():nullptr;
+@@ -80,7 +82,9 @@ inline void WRx3Browser::showMixmanImport(const QString& root,std::function<void
+             QDir().mkpath(QFileInfo(to).absolutePath());
+             const QString part=to+".part";
+             QFile::remove(part);
+-            if(!QFile::copy(from,part) || !QFile::rename(part,to)) {QFile::remove(part);++job->failed;return;}
++            // A file fetched from the network sits in the temporary cache: move it, copy only across drives.
++            const bool fromNetwork=mixxx::network::NetworkManager::isNetworkRoot(job->root);
++            if(!((fromNetwork && QFile::rename(from,part)) || QFile::copy(from,part)) || !QFile::rename(part,to)) {QFile::remove(part);++job->failed;return;}
+             job->bytes+=size;
+         }
+         bool already=false;
+@@ -119,6 +123,22 @@ inline void WRx3Browser::showMixmanImport(const QString& root,std::function<void
+         }
+         if(source.mainCue>=0) track->setMainCuePosition(mixxx::audio::FramePos::fromEngineSamplePosMaybeInvalid(source.mainCue));
+     };
++    // Audio of a network library is fetched first (worker thread), then applied here.
++    const auto step=[guard,job,apply](std::function<void()> next) {
++        if(!guard) return;
++        auto* manager=mixxx::network::NetworkManager::instance();
++        if(!manager || !mixxx::network::NetworkManager::isNetworkRoot(job->root) || job->index>=job->stick.tracks.size()) {
++            apply();next();return;
++        }
++        const QString relative=job->stick.tracks[job->index].relativePath;
++        const QString root=job->root;
++        auto* self=guard.data();
++        (void)QtConcurrent::run([guard,self,apply,next,manager,root,relative] {
++            QString error;
++            manager->ensureFile(root,relative,&error);
++            QMetaObject::invokeMethod(self,[guard,apply,next]{if(guard){apply();next();}},Qt::QueuedConnection);
++        });
++    };
+     // Crates and playlists, merged by name once every track is in the library.
+     const auto finish=[guard,job]() {
+         if(!guard) return;
+@@ -167,10 +187,14 @@ inline void WRx3Browser::showMixmanImport(const QString& root,std::function<void
+         if(!guard) return;
+         auto* self=guard.data();
+         if(job->index<job->stick.tracks.size()) {
+-            step();++job->index;
+-            self->m_tools->message(QString("Importing %1 / %2 …").arg(job->index).arg(job->stick.tracks.size()));
+-            self->m_tools->refresh();
+-            QTimer::singleShot(0,self,[run]{(*run)();});
++            step([guard,job,run]{
++                if(!guard) return;
++                auto* self=guard.data();
++                ++job->index;
++                self->m_tools->message(QString("Importing %1 / %2 …").arg(job->index).arg(job->stick.tracks.size()));
++                self->m_tools->refresh();
++                QTimer::singleShot(0,self,[run]{(*run)();});
++            });
+         } else {
+             finish();
+             self->m_tools->message(job->summary);self->m_tools->refresh();
+diff --git a/src/widget/wrx3browserutility.h b/src/widget/wrx3browserutility.h
+index eaabbb2..375e934 100644
+--- a/src/widget/wrx3browserutility.h
++++ b/src/widget/wrx3browserutility.h
+@@ -117,6 +117,36 @@ inline void WRx3Browser::showUtility() {
+         if(roots.isEmpty()) {m_tools->message("Plug in a stick exported by mixman (it has a MIXMAN folder).");return;}
+         showMixmanImport(roots.first());});
+     action("BROWSER","TRACK TOOLS (CRATE / PLAYLIST / BPM / COLOR)",[this]{showTrackToolsMenu();});
++    if(auto* net=networkManager()) {
++        // SOURCE > NETWORK settings: sharing this library and the PIN both sides use.
++        {
++            Setting share{"NETWORK","SHARE MY LIBRARY",{"OFF","ON"},
++                    [net]{return net->shareEnabled()?QString("ON"):QString("OFF");},
++                    [net]{return net->shareEnabled()?1:0;},
++                    [net](int index){net->setShareEnabled(index==1);return true;},
++                    "Lets other NauticMixxx on this network browse, load and import your STORAGE library (read-only). Set a PIN first on shared networks."};
++            settings.push_back(std::move(share));
++        }
++        {
++            Setting status{"NETWORK","SHARE STATUS",{},[net]{return net->shareStatus();},{},{},
++                    "Port 48210 (TCP) and 48211 (UDP announcements). Other machines see this one as NAUTICMIXXX under SOURCE > NETWORK."};
++            settings.push_back(std::move(status));
++        }
++        for(int digit=0;digit<4;++digit) {
++            QStringList choices{"-"};
++            for(int n=0;n<=9;++n) choices<<QString::number(n);
++            Setting pin{"NETWORK",QString("NETWORK PIN DIGIT %1").arg(digit+1),choices,
++                    [net,digit]{const QString value=net->pin();return digit<value.size() && value[digit].isDigit()?QString(value[digit]):QString("-");},
++                    [net,digit]{const QString value=net->pin();return digit<value.size() && value[digit].isDigit()?value[digit].digitValue()+1:0;},
++                    [net,digit](int index){
++                        QString value=net->pin();
++                        while(value.size()<4) value.append(QLatin1Char('-'));
++                        value[digit]=index<=0?QLatin1Char('-'):QChar('0'+index-1);
++                        net->setPin(value);return true;},
++                    "The same PIN must be set here and on the machine you connect to. All dashes = no PIN. Digits are signed, the PIN itself is never sent."};
++            settings.push_back(std::move(pin));
++        }
++    }
+     action("RECORDING","USB RECORDING",[this]{showRecordingTools();});
+     action("GENERAL","POWER (EXIT / SLEEP / SHUTDOWN)",[this]{showPowerMenu();});
+     {

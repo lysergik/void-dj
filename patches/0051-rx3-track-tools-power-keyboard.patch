@@ -1,0 +1,669 @@
+diff --git a/src/skin/legacy/legacyskinparser.cpp b/src/skin/legacy/legacyskinparser.cpp
+index 8a755ec..4eccad9 100644
+--- a/src/skin/legacy/legacyskinparser.cpp
++++ b/src/skin/legacy/legacyskinparser.cpp
+@@ -64,6 +64,7 @@
+ #include "widget/rx3displaystate.h"
+ #include "widget/wrx3shortcut.h"
+ #include "widget/rx3ui.h"
++#include "widget/wrx3keyboard.h"
+ #include "widget/wrx3beatfx.h"
+ #include "widget/wrx3info.h"
+ #include "widget/wrx3emergency.h"
+@@ -469,6 +470,7 @@ QWidget* LegacySkinParser::parseSkin(const QString& skinPath, QWidget* pParent)
+         new WRx3Countdown(m_pConfig,widgets[0]);
+         new WRx3Info(m_pLibrary,widgets[0]);
+         new WRx3Emergency(widgets[0]);
++        new WRx3Keyboard(widgets[0]);
+         rx3State->bindCanvas(widgets[0]);
+     }
+     const QString reference = m_pContext->selectString(skinDocument, "ReferenceSize");
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index a50773b..b8e46dc 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -20,6 +20,8 @@
+ #include <QVBoxLayout>
+ #include <QHBoxLayout>
+ #include <QTimer>
++#include <QElapsedTimer>
++#include "track/beats.h"
+ #include <QKeyEvent>
+ #include <QSqlQuery>
+ #include <QStorageInfo>
+@@ -327,6 +329,9 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         } });
+         makeControl("open", [this](double value){ if(value > 0) openBrowser(); });
+         makeControl("tools",[this](double value){if(value>0) showTools();});
++        makeControl("track_tools",[this](double value){if(value>0) showTrackTools();});
++        makeControl("close_tools",[this](double value){if(value>0 && m_utilitySessionActive) closeUtility();});
++        makeControl("power",[this](double value){if(value>0) showPowerTools();});
+         makeControl("utility",[this](double value){if(value>0) {if(m_pages->currentWidget()==m_utility) closeUtility();else showUtility();}});
+         makeControl("browse",[this](double value){if(value>0) browseSelectedSource();});
+         makeControl("tag_list",[this](double value){if(value>0) openSourceSection("TAG LIST");});
+@@ -1356,9 +1361,10 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     }
+     QString toggleStorageCrate(CrateId crateId,const QString& name,bool locked) {
+         auto* collection=storageCollection();
+-        if(!collection || !m_toolTrack || !m_toolTrack->getId().isValid()) return QStringLiteral("Select a STORAGE track first.");
++        const TrackPointer target=toolTarget();
++        if(!collection || !target || !target->getId().isValid()) return QStringLiteral("Select a STORAGE track first.");
+         if(locked) return QString("Crate %1 is locked.").arg(name);
+-        const TrackId trackId=m_toolTrack->getId();
++        const TrackId trackId=target->getId();
+         bool present=false;
+         {
+             auto result=collection->crates().selectCrateTracksSorted(crateId);
+@@ -1374,26 +1380,34 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     // crate itself; crates made elsewhere in Mixxx appear in the same menu.
+     QString createTagCrate() {
+         auto* collection=storageCollection();
+-        if(!collection || !m_toolTrack || !m_toolTrack->getId().isValid()) return QStringLiteral("Select a STORAGE track first.");
++        if(!collection || !toolTarget() || !toolTarget()->getId().isValid()) return QStringLiteral("Select a STORAGE track first.");
+         Crate created;created.setName(QStringLiteral("TAG LIST"));
+         CrateId id;
+         if(!collection->insertCrate(created,&id) || !id.isValid()) return QStringLiteral("TAG LIST crate could not be created.");
+         return toggleStorageCrate(id,QStringLiteral("TAG LIST"),false);
+     }
+-    void showStorageCrateTools() {
++    bool trackInCrate(CrateId crateId) const {
++        auto* collection=storageCollection();const TrackPointer target=toolTarget();
++        if(!collection || !target || !target->getId().isValid()) return false;
++        auto result=collection->crates().selectCrateTracksSorted(crateId);
++        while(result.next()) if(result.trackId()==target->getId()) return true;
++        return false;
++    }
++    void showStorageCrateTools(std::function<void()> back={}) {
+         std::vector<ToolAction> actions;
+         const auto crates=storageCrates();
+         auto* collection=storageCollection();
+         if(collection && !collection->crates().readCrateByName(QStringLiteral("TAG LIST")))
+-            actions.push_back(toolAction("NEW CRATE: TAG LIST  (ADD SELECTED TRACK)",[this]{
+-                const QString result=createTagCrate();showStorageCrateTools();m_tools->message(result);}));
++            actions.push_back(toolAction("NEW CRATE: TAG LIST  (ADD SELECTED TRACK)",[this,back]{
++                const QString result=createTagCrate();showStorageCrateTools(back);m_tools->message(result);}));
+         for(const auto& crate:crates) {
+             const CrateId id=crate.getId();const QString name=crate.getName();const bool locked=crate.isLocked();
+-            actions.push_back(toolAction(locked?name+"  (locked)":name,
+-                    [this,id,name,locked]{m_tools->message(toggleStorageCrate(id,name,locked));}));
++            actions.push_back({[this,id,name,locked]{
++                        return QString(trackInCrate(id)?"●  ":"○  ")+(locked?name+"  (locked)":name);},
++                    [this,id,name,locked]{m_tools->message(toggleStorageCrate(id,name,locked));},{}});
+         }
+         actions.push_back(toolAction("OPEN CRATES",[this]{openStorageCrates();}));
+-        m_tools->showMenu("CRATES / TAG TRACK",std::move(actions),[this]{showTools();});
++        m_tools->showMenu("CRATES / TAG TRACK",std::move(actions),back?back:std::function<void()>([this]{showTools();}));
+         m_tools->message(crates.isEmpty()?
+                 QStringLiteral("No crates yet. NEW CRATE: TAG LIST starts one with the selected track."):
+                 QStringLiteral("Press a crate to add or remove the selected track."));
+@@ -1603,6 +1617,26 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     void toolTracks(const QList<quint32>& ids,const QString& name);
+     QString tagIdentity() const;
+     void saveTagPlaylist();
++    // TRACK TOOLS and POWER (patch 0051): crate, playlist, BPM and colour edits
++    // of the selected or loaded track, and EXIT / SLEEP / SHUTDOWN.
++    TrackPointer toolTarget() const;
++    QString toolTargetLabel() const;
++    void showTrackTools();
++    void showTrackToolsMenu();
++    void showTrackCrateMenu();
++    void showTrackPlaylistMenu();
++    void showTrackBpmMenu();
++    void showTrackColorMenu();
++    void showPowerTools();
++    void showPowerMenu();
++    QString trackEditBlocked() const;
++    QString scaleTrackBpm(mixxx::Beats::BpmScale scale);
++    QString toggleTrackPlaylist(int playlistId);
++    QString createTrackPlaylist();
++    bool confirmed(const QString& id);
++    int m_trackToolDeck=0;
++    QString m_confirmId;
++    QElapsedTimer m_confirmClock;
+     using ToolAction=WRx3ToolMenu::Action;
+     static ToolAction toolAction(QString label,std::function<void()> execute) {return {[label]{return label;},std::move(execute),{}};}
+     ToolAction audioValue(QString label,QString group,QString key,QString configuredKey = {});
+@@ -1693,3 +1727,4 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+ 
+ #include "widget/wrx3browsertools.h"
+ #include "widget/wrx3browserutility.h"
++#include "widget/wrx3browsertrack.h"
+diff --git a/src/widget/wrx3browsertrack.h b/src/widget/wrx3browsertrack.h
+new file mode 100644
+index 0000000..29feb4e
+--- /dev/null
++++ b/src/widget/wrx3browsertrack.h
+@@ -0,0 +1,257 @@
++#pragma once
++
++#include <QColor>
++#include <QProcess>
++
++#include "library/dao/playlistdao.h"
++#include "mixer/playerinfo.h"
++#include "preferences/colorpalettesettings.h"
++#include "util/color/colorpalette.h"
++#include "util/color/rgbcolor.h"
++
++// TRACK TOOLS: crate, playlist, BPM and colour edits of one track, and POWER.
++// Both are ordinary UTILITY tool pages, so every action follows the shared
++// encoder contract (turn selects, press executes, hold = back) and is also
++// reachable from the keyboard and controller mappings through the
++// [RX3Browser],track_tools and [RX3Browser],power controls.
++
++// The track the tools act on: a deck chosen in the TARGET row, else the track
++// selected in the browser when TRACK TOOLS was opened, else the active deck.
++inline TrackPointer WRx3Browser::toolTarget() const {
++    const auto deckTrack=[](int deck) {
++        return PlayerInfo::instance().getTrackInfo(QString("[Channel%1]").arg(deck));
++    };
++    if(m_trackToolDeck>0) return deckTrack(m_trackToolDeck);
++    if(m_toolTrack) return m_toolTrack;
++    return deckTrack(qRound(ControlObject::get(ConfigKey("[RX3Controller]","active_deck")))==2?2:1);
++}
++
++inline QString WRx3Browser::toolTargetLabel() const {
++    const auto track=toolTarget();
++    QString who=m_trackToolDeck>0?QString("DECK %1").arg(m_trackToolDeck):
++            (m_toolTrack?QString("SELECTED"):QString("ACTIVE DECK"));
++    QString name=track?track->getTitle():QString();
++    if(track && name.isEmpty()) name=track->getFileInfo().fileName();
++    if(name.size()>38) name=name.left(37)+QStringLiteral("…");
++    return QString("TARGET (%1): %2").arg(who,name.isEmpty()?QStringLiteral("NONE"):name);
++}
++
++// Empty when the target may be edited, else the reason it may not.
++inline QString WRx3Browser::trackEditBlocked() const {
++    const auto track=toolTarget();
++    if(!track) return QStringLiteral("No track: select one in BROWSE or load a deck.");
++    if(!track->getUsePolicy().canPersist()) return QStringLiteral("USB tracks are read-only. Use TAG LIST for USB tracks.");
++    return {};
++}
++
++inline bool WRx3Browser::confirmed(const QString& id) {
++    if(m_confirmId==id && m_confirmClock.isValid() && m_confirmClock.elapsed()<4000) {
++        m_confirmId.clear();return true;
++    }
++    m_confirmId=id;m_confirmClock.restart();return false;
++}
++
++inline void WRx3Browser::showTrackTools() {
++    showUtility();
++    openUtilityTools("TRACK TOOLS",[this]{showTrackToolsMenu();});
++}
++
++inline void WRx3Browser::showTrackToolsMenu() {
++    std::vector<ToolAction> actions;
++    ToolAction target;
++    target.label=[this]{return toolTargetLabel();};
++    target.execute=[]{};
++    target.adjust=[this](int delta){m_trackToolDeck=((m_trackToolDeck+delta)%3+3)%3;};
++    actions.push_back(std::move(target));
++    actions.push_back(toolAction("ADD TO CRATE  ›",[this]{showTrackCrateMenu();}));
++    actions.push_back(toolAction("ADD TO PLAYLIST  ›",[this]{showTrackPlaylistMenu();}));
++    actions.push_back(toolAction("BPM  ›",[this]{showTrackBpmMenu();}));
++    actions.push_back(toolAction("COLOR  ›",[this]{showTrackColorMenu();}));
++    m_tools->showMenu("TRACK TOOLS",std::move(actions),[this]{showUtility();});
++    m_tools->message("Press TARGET, then turn to pick SELECTED / DECK 1 / DECK 2.");
++}
++
++inline void WRx3Browser::showTrackCrateMenu() {
++    const QString blocked=trackEditBlocked();
++    if(!storageCollection() || !blocked.isEmpty()) {m_tools->message(blocked.isEmpty()?QStringLiteral("STORAGE is unavailable."):blocked);return;}
++    showStorageCrateTools([this]{showTrackToolsMenu();});
++}
++
++inline QString WRx3Browser::toggleTrackPlaylist(int playlistId) {
++    auto* collection=storageCollection();const auto track=toolTarget();
++    if(!collection || !track || !track->getId().isValid()) return QStringLiteral("Select a STORAGE track first.");
++    auto& dao=collection->getPlaylistDAO();
++    const QString name=dao.getPlaylistName(playlistId);
++    if(dao.isPlaylistLocked(playlistId)) return QString("Playlist %1 is locked.").arg(name);
++    if(dao.isTrackInPlaylist(track->getId(),playlistId)) {
++        dao.removeTracksFromPlaylistById(playlistId,track->getId());
++        return QString("Removed from playlist %1.").arg(name);
++    }
++    return dao.appendTrackToPlaylist(track->getId(),playlistId)?
++            QString("Added to playlist %1.").arg(name):QStringLiteral("Playlist update failed.");
++}
++
++inline QString WRx3Browser::createTrackPlaylist() {
++    auto* collection=storageCollection();const auto track=toolTarget();
++    if(!collection || !track || !track->getId().isValid()) return QStringLiteral("Select a STORAGE track first.");
++    QString name=QString("NEW %1").arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HH-mm"));
++    const int id=collection->getPlaylistDAO().createUniquePlaylist(&name);
++    if(id<0) return QStringLiteral("Playlist could not be created.");
++    return toggleTrackPlaylist(id);
++}
++
++inline void WRx3Browser::showTrackPlaylistMenu() {
++    const QString blocked=trackEditBlocked();
++    auto* collection=storageCollection();
++    if(!collection || !blocked.isEmpty()) {m_tools->message(blocked.isEmpty()?QStringLiteral("STORAGE is unavailable."):blocked);return;}
++    std::vector<ToolAction> actions;
++    actions.push_back(toolAction("NEW PLAYLIST  (ADD TRACK)",[this]{
++        const QString result=createTrackPlaylist();showTrackPlaylistMenu();m_tools->message(result);}));
++    auto& dao=collection->getPlaylistDAO();
++    for(const auto& entry:dao.getPlaylists(PlaylistDAO::PLHT_NOT_HIDDEN)) {
++        const int id=entry.first;const QString name=entry.second;
++        actions.push_back({[this,id,name]{
++                    auto* c=storageCollection();const auto track=toolTarget();
++                    const bool present=c && track && track->getId().isValid() &&
++                            c->getPlaylistDAO().isTrackInPlaylist(track->getId(),id);
++                    QString text=QString::fromUtf8(present?"●  ":"○  ");text.append(name);return text;},
++                [this,id]{m_tools->message(toggleTrackPlaylist(id));},{}});
++    }
++    m_tools->showMenu("ADD TO PLAYLIST",std::move(actions),[this]{showTrackToolsMenu();});
++    m_tools->message("Press a playlist to add or remove the track (● = already in it).");
++}
++
++inline QString WRx3Browser::scaleTrackBpm(mixxx::Beats::BpmScale scale) {
++    const QString blocked=trackEditBlocked();
++    if(!blocked.isEmpty()) return blocked;
++    const auto track=toolTarget();
++    if(track->isBpmLocked()) return QStringLiteral("BPM is locked. Choose UNLOCK BPM first.");
++    const mixxx::BeatsPointer beats=track->getBeats();
++    if(!beats) return QStringLiteral("This track has no beatgrid.");
++    const auto scaled=beats->tryScale(scale);
++    if(!scaled || !track->trySetBeats(*scaled)) return QStringLiteral("The beatgrid could not be scaled.");
++    return QString("BPM is now %1").arg(track->getBpm(),0,'f',2);
++}
++
++inline void WRx3Browser::showTrackBpmMenu() {
++    if(const QString blocked=trackEditBlocked();!blocked.isEmpty()) {m_tools->message(blocked);return;}
++    std::vector<ToolAction> actions;
++    actions.push_back({[this]{
++                const auto track=toolTarget();
++                return track?QString("BPM: %1%2").arg(track->getBpm(),0,'f',2).arg(track->isBpmLocked()?"  (LOCKED)":""):
++                        QStringLiteral("BPM: —");},
++            []{},{}});
++    using Scale=mixxx::Beats::BpmScale;
++    const struct {const char* label;Scale scale;} scales[]{
++            {"DOUBLE  (× 2)",Scale::Double},{"HALVE  (÷ 2)",Scale::Halve},
++            {"× 2/3",Scale::TwoThirds},{"× 3/4",Scale::ThreeFourths},
++            {"× 4/3",Scale::FourThirds},{"× 3/2",Scale::ThreeHalves}};
++    for(const auto& entry:scales) {
++        const Scale scale=entry.scale;
++        actions.push_back(toolAction(entry.label,[this,scale]{m_tools->message(scaleTrackBpm(scale));}));
++    }
++    actions.push_back({[this]{
++                const auto track=toolTarget();
++                return QString(track && track->isBpmLocked()?"UNLOCK BPM":"LOCK BPM");},
++            [this]{
++                if(const QString blocked=trackEditBlocked();!blocked.isEmpty()) {m_tools->message(blocked);return;}
++                const auto track=toolTarget();track->setBpmLocked(!track->isBpmLocked());
++                m_tools->message(track->isBpmLocked()?"BPM locked.":"BPM unlocked.");},{}});
++    actions.push_back(toolAction("UNDO LAST BPM / GRID CHANGE",[this]{
++        if(const QString blocked=trackEditBlocked();!blocked.isEmpty()) {m_tools->message(blocked);return;}
++        const auto track=toolTarget();
++        if(!track->canUndoBeatsChange()) {m_tools->message("Nothing to undo.");return;}
++        track->undoBeatsChange();m_tools->message(QString("BPM is now %1").arg(track->getBpm(),0,'f',2));}));
++    actions.push_back({[this]{
++                return QString(m_confirmId=="reset_beats" && m_confirmClock.isValid() && m_confirmClock.elapsed()<4000?
++                        "RESET BEATGRID — PRESS AGAIN TO CONFIRM":"RESET BEATGRID");},
++            [this]{
++                if(const QString blocked=trackEditBlocked();!blocked.isEmpty()) {m_tools->message(blocked);return;}
++                const auto track=toolTarget();
++                if(track->isBpmLocked()) {m_tools->message("BPM is locked. Choose UNLOCK BPM first.");return;}
++                if(!confirmed("reset_beats")) {m_tools->message("Press again within 4 seconds to erase the beatgrid.");return;}
++                track->trySetBeats(mixxx::BeatsPointer());m_tools->message("Beatgrid erased. UNDO restores it.");},{}});
++    m_tools->showMenu("BPM",std::move(actions),[this]{showTrackToolsMenu();});
++    m_tools->message("Changes apply immediately, also to a playing deck.");
++}
++
++namespace rx3 {
++// Plain colour names so a palette can be read at a glance on a small screen.
++inline QString colorName(const QColor& color) {
++    const int h=color.hsvHue(),s=color.hsvSaturation(),v=color.value();
++    if(v<70) return QStringLiteral("BLACK");
++    if(s<45) return v>190?QStringLiteral("WHITE"):QStringLiteral("GREY");
++    if(h<15 || h>=345) return QStringLiteral("RED");
++    if(h<40) return QStringLiteral("ORANGE");
++    if(h<70) return QStringLiteral("YELLOW");
++    if(h<165) return QStringLiteral("GREEN");
++    if(h<200) return QStringLiteral("AQUA");
++    if(h<255) return QStringLiteral("BLUE");
++    if(h<290) return QStringLiteral("PURPLE");
++    return QStringLiteral("PINK");
++}
++} // namespace rx3
++
++inline void WRx3Browser::showTrackColorMenu() {
++    if(const QString blocked=trackEditBlocked();!blocked.isEmpty()) {m_tools->message(blocked);return;}
++    const ColorPalette palette=ColorPaletteSettings(m_config).getTrackColorPalette();
++    std::vector<ToolAction> actions;
++    actions.push_back({[this]{
++                const auto track=toolTarget();
++                return QString::fromUtf8(track && !track->getColor()?"●  NO COLOR":"○  NO COLOR");},
++            [this]{
++                if(const QString blocked=trackEditBlocked();!blocked.isEmpty()) {m_tools->message(blocked);return;}
++                toolTarget()->setColor(std::nullopt);m_tools->message("Track colour removed.");},{}});
++    for(int i=0;i<palette.size();++i) {
++        const mixxx::RgbColor rgb=palette.at(i);
++        const QColor color=mixxx::RgbColor::toQColor(rgb);
++        const QString name=rx3::colorName(color);
++        ToolAction action;
++        action.label=[this,rgb,name]{
++            const auto track=toolTarget();
++            const auto current=track?track->getColor():std::nullopt;
++            QString text=QString::fromUtf8(current && *current==rgb?"●  ":"■  ");text.append(name);return text;};
++        action.execute=[this,rgb,name]{
++            if(const QString blocked=trackEditBlocked();!blocked.isEmpty()) {m_tools->message(blocked);return;}
++            toolTarget()->setColor(rgb);m_tools->message("Track colour: "+name);};
++        action.tint=[color]{return color;};
++        actions.push_back(std::move(action));
++    }
++    m_tools->showMenu("TRACK COLOR",std::move(actions),[this]{showTrackToolsMenu();});
++    m_tools->message("Press a colour to set it (● = current). The colour shows in every library view.");
++}
++
++inline void WRx3Browser::showPowerTools() {
++    showUtility();
++    openUtilityTools("POWER",[this]{showPowerMenu();});
++}
++
++inline void WRx3Browser::showPowerMenu() {
++    std::vector<ToolAction> actions;
++    const auto pending=[this](const QString& id) {
++        return m_confirmId==id && m_confirmClock.isValid() && m_confirmClock.elapsed()<4000;
++    };
++    const auto quit=[this]{if(auto* top=window()) top->close();};
++    actions.push_back({[pending]{return QString(pending("exit")?"EXIT NAUTICMIXXX — PRESS AGAIN TO CONFIRM":"EXIT NAUTICMIXXX");},
++            [this,quit]{
++                if(!confirmed("exit")) {m_tools->message("Press again within 4 seconds to close NauticMixxx.");return;}
++                QTimer::singleShot(0,this,quit);},{}});
++#ifdef Q_OS_LINUX
++    actions.push_back({[pending]{return QString(pending("sleep")?"SLEEP — PRESS AGAIN TO CONFIRM":"SLEEP  (SUSPEND THE DEVICE)");},
++            [this]{
++                if(!confirmed("sleep")) {m_tools->message("Press again within 4 seconds to suspend the device.");return;}
++                QProcess::startDetached("sh",{"-c","systemctl suspend || loginctl suspend"});},{}});
++    actions.push_back({[pending]{return QString(pending("shutdown")?"SHUTDOWN — PRESS AGAIN TO CONFIRM":"SHUTDOWN  (EXIT AND POWER OFF)");},
++            [this,quit]{
++                if(!confirmed("shutdown")) {m_tools->message("Press again within 4 seconds: NauticMixxx exits, then the device powers off.");return;}
++                // Started first, delayed so Mixxx can finish saving before the session ends.
++                QProcess::startDetached("sh",{"-c","sleep 3; systemctl poweroff || loginctl poweroff || shutdown -h now"});
++                QTimer::singleShot(0,this,quit);},{}});
++#endif
++    m_tools->showMenu("POWER",std::move(actions),[this]{showUtility();});
++#ifdef Q_OS_LINUX
++    m_tools->message("Each action asks for a second press. SLEEP and SHUTDOWN use systemd/logind.");
++#else
++    m_tools->message("Press EXIT twice to close NauticMixxx.");
++#endif
++}
+diff --git a/src/widget/wrx3browserutility.h b/src/widget/wrx3browserutility.h
+index c960107..95992f1 100644
+--- a/src/widget/wrx3browserutility.h
++++ b/src/widget/wrx3browserutility.h
+@@ -106,7 +106,9 @@ inline void WRx3Browser::showUtility() {
+         };
+         settings.push_back(std::move(analyze));
+     }
++    action("BROWSER","TRACK TOOLS (CRATE / PLAYLIST / BPM / COLOR)",[this]{showTrackToolsMenu();});
+     action("RECORDING","USB RECORDING",[this]{showRecordingTools();});
++    action("GENERAL","POWER (EXIT / SLEEP / SHUTDOWN)",[this]{showPowerMenu();});
+     {
+         QStringList resolutions;QList<double> indexes;
+         for(int i=0;i<rx3ui::kProfileCount;++i) {
+diff --git a/src/widget/wrx3keyboard.h b/src/widget/wrx3keyboard.h
+new file mode 100644
+index 0000000..ef33249
+--- /dev/null
++++ b/src/widget/wrx3keyboard.h
+@@ -0,0 +1,174 @@
++#pragma once
++
++#include <QApplication>
++#include <QKeyEvent>
++#include <QLineEdit>
++#include <QObject>
++#include <QPlainTextEdit>
++#include <QPointer>
++#include <QTextEdit>
++#include <QWidget>
++
++#include "control/controlobject.h"
++
++// Keyboard layer of the RX3 skins (patch 0051). It mirrors the controller
++// gestures of the DDJ presets so the whole interface can be driven without a
++// controller. Keys are handled only for the main window (not for dialogs, and
++// without needing a window manager to report focus), so
++// Preferences and other dialogs keep their own Return/Escape behaviour, and
++// text fields keep Backspace/Left/Right.
++//
++//   Up / Down            BROWSE turn           Shift+Up/Down (or Shift+Left/Right)
++//   Return / Enter       BROWSE press                          step the header
++//   Backspace            BACK                  F1  SOURCE
++//   Shift+Return         BACK                  F2  BROWSE <-> PERFORMANCE
++//   Escape               close SHORTCUT / BACK F3  SHORTCUT
++//   F4  TRACK TOOLS      F5  UTILITY (MENU)    F6  GRID on/off
++//   F7  TAG LIST         F8  PLAYLIST          F9  SEARCH
++//   F10 POWER            Ctrl+1..4 LOAD to deck 1..4
++class WRx3Keyboard : public QObject {
++  public:
++    explicit WRx3Keyboard(QWidget* canvas) : QObject(canvas), m_canvas(canvas) {
++        qApp->installEventFilter(this);
++    }
++    ~WRx3Keyboard() override {
++        if(qApp) qApp->removeEventFilter(this);
++    }
++
++  protected:
++    bool eventFilter(QObject* watched, QEvent* event) override {
++        if(event->type()!=QEvent::KeyPress || !m_canvas) return false;
++        auto* widget=qobject_cast<QWidget*>(watched);
++        if(!widget || widget->window()!=m_canvas->window()) return false;
++        auto* key=static_cast<QKeyEvent*>(event);
++        const bool typing=qobject_cast<QLineEdit*>(QApplication::focusWidget()) ||
++                qobject_cast<QTextEdit*>(QApplication::focusWidget()) ||
++                qobject_cast<QPlainTextEdit*>(QApplication::focusWidget());
++        const auto mods=key->modifiers()&~Qt::KeypadModifier;
++        const bool shift=mods==Qt::ShiftModifier,plain=mods==Qt::NoModifier,ctrl=mods==Qt::ControlModifier;
++        const int code=key->key();
++        if(key->isAutoRepeat() && !(code==Qt::Key_Up || code==Qt::Key_Down)) return false;
++        if(plain) {
++            switch(code) {
++            case Qt::Key_Up: turn(-1);return true;
++            case Qt::Key_Down: turn(1);return true;
++            case Qt::Key_Return: case Qt::Key_Enter: press();return true;
++            case Qt::Key_Backspace: if(typing) return false;back();return true;
++            case Qt::Key_Escape: escape();return true;
++            case Qt::Key_F1: source();return true;
++            case Qt::Key_F2: view();return true;
++            case Qt::Key_F3: pulse("[RX3Shortcut]","toggle");return true;
++            case Qt::Key_F4: header("track_tools");return true;
++            case Qt::Key_F5: header("utility");return true;
++            case Qt::Key_F6: grid();return true;
++            case Qt::Key_F7: header("tag_list");return true;
++            case Qt::Key_F8: header("playlist");return true;
++            case Qt::Key_F9: header("search");return true;
++            case Qt::Key_F10: power();return true;
++            default: return false;
++            }
++        }
++        if(shift) {
++            switch(code) {
++            case Qt::Key_Up: case Qt::Key_Left: step(-1);return true;
++            case Qt::Key_Down: case Qt::Key_Right: step(1);return true;
++            case Qt::Key_Return: case Qt::Key_Enter: back();return true;
++            default: return false;
++            }
++        }
++        if(ctrl && code>=Qt::Key_1 && code<=Qt::Key_4) {
++            const auto group=QString("[Channel%1]").arg(code-Qt::Key_0).toLatin1();
++            pulse(group.constData(),"LoadSelectedTrack");return true;
++        }
++        return false;
++    }
++
++  private:
++    static double get(const char* group,const char* item) {return ControlObject::get(ConfigKey(group,item));}
++    static void set(const char* group,const char* item,double value) {
++        if(ControlObject::exists(ConfigKey(group,item))) ControlObject::set(ConfigKey(group,item),value);
++    }
++    static void pulse(const char* group,const char* item,double value=1) {
++        if(!ControlObject::exists(ConfigKey(group,item))) return;
++        ControlObject::set(ConfigKey(group,item),value);ControlObject::set(ConfigKey(group,item),0);
++    }
++    static bool browserOpen() {return qRound(get("[Tab]","current"))==1;}
++    static bool shortcutVisible() {return get("[RX3Shortcut]","visible")>0;}
++    static bool infoVisible() {return get("[RX3Info]","visible")>0;}
++    // Same sequence as the controller scripts' open().
++    static bool openBrowser() {
++        if(browserOpen()) return false;
++        set("[XDJ_RX3]","search_active",0);set("[Tab]","library",1);set("[Skin]","show_maximized_library",1);
++        pulse("[RX3Browser]","open");
++        return true;
++    }
++    void turn(int direction) {
++        if(infoVisible()) {pulse("[RX3Info]","move",direction);return;}
++        if(shortcutVisible()) {pulse("[RX3Shortcut]","move",direction);return;}
++        if(get("[RX3Controller]","grid_mode")>0) {
++            const int deck=qRound(get("[RX3Controller]","active_deck"))==2?2:1;
++            const auto group=QString("[Channel%1]").arg(deck).toLatin1();
++            set(group.constData(),"beats_translate_move",direction);return;
++        }
++        if(browserOpen()) pulse("[RX3Browser]","move",direction);
++    }
++    void press() {
++        if(infoVisible()) {pulse("[RX3Info]","enter");return;}
++        if(shortcutVisible()) {pulse("[RX3Shortcut]","enter");return;}
++        if(get("[RX3Controller]","grid_mode")>0) {set("[RX3Controller]","grid_mode",0);return;}
++        if(!openBrowser()) pulse("[RX3Browser]","enter");
++    }
++    void back() {
++        if(shortcutVisible() || infoVisible()) return;
++        if(browserOpen()) pulse("[RX3Browser]","back");
++    }
++    void escape() {
++        if(shortcutVisible()) {pulse("[RX3Shortcut]","toggle");return;}
++        if(get("[RX3Controller]","grid_mode")>0) {set("[RX3Controller]","grid_mode",0);return;}
++        back();
++    }
++    void grid() {
++        if(browserOpen()) return;
++        set("[RX3Controller]","grid_mode",get("[RX3Controller]","grid_mode")>0?0:1);
++    }
++    void source() {
++        m_section=0;
++        if(shortcutVisible()) {pulse("[RX3Shortcut]","toggle");return;}
++        openBrowser();pulse("[RX3Browser]","source");
++    }
++    void view() {
++        m_section=-1;
++        if(shortcutVisible()) pulse("[RX3Shortcut]","toggle");
++        if(openBrowser()) return;
++        set("[Skin]","show_maximized_library",0);set("[Tab]","overview",1);
++    }
++    void power() {
++        if(infoVisible()) return;
++        if(shortcutVisible()) pulse("[RX3Shortcut]","toggle");
++        openBrowser();
++        pulse("[RX3Browser]","power");m_section=5;
++    }
++    void header(const char* name) {
++        if(shortcutVisible() || infoVisible()) return;
++        openBrowser();
++        pulse("[RX3Browser]",name);
++        for(int i=0;i<kSections;++i) if(qstrcmp(name,kSection[i])==0) m_section=i;
++    }
++    // SHIFT+turn on the controllers: SOURCE, BROWSE, TAG LIST, PLAYLIST,
++    // SEARCH, MENU, then TRACK TOOLS.
++    void step(int direction) {
++        if(shortcutVisible() || infoVisible()) return;
++        const bool wasClosed=openBrowser();
++        int next=wasClosed?0:(m_section<0?1:m_section+direction);
++        next=qBound(0,next,kSections-1);
++        if(next==m_section && !wasClosed) return;
++        // UTILITY and TRACK TOOLS are toggled/stacked pages: leave them first.
++        if(m_section>=5 && next!=m_section) pulse("[RX3Browser]","close_tools");
++        m_section=next;
++        pulse("[RX3Browser]",kSection[next]);
++    }
++    static constexpr int kSections=7;
++    static constexpr const char* kSection[kSections]={"source","browse","tag_list","playlist","search","utility","track_tools"};
++    QPointer<QWidget> m_canvas;
++    int m_section=-1;
++};
+diff --git a/src/widget/wrx3shortcut.h b/src/widget/wrx3shortcut.h
+index 58a9d62..3fa2004 100644
+--- a/src/widget/wrx3shortcut.h
++++ b/src/widget/wrx3shortcut.h
+@@ -194,6 +194,12 @@ class WRx3Shortcut : public QFrame {
+         auto* tools=new QPushButton("UTILITY",toolsFrame);
+         toolsLayout->addWidget(tools);toolsFrame->setFixedHeight(rx3ui::S(30));titleRow->insertWidget(titleRow->count()-1,toolsFrame);connect(tools,&QPushButton::clicked,this,[this]{openTools();});
+         Row toolsRow;toolsRow.key="browser_tools";toolsRow.frame=toolsFrame;toolsRow.buttons={tools};m_rows.push_back(toolsRow);
++        // POWER opens EXIT / SLEEP / SHUTDOWN (each asks for a second press).
++        auto* powerFrame=new QFrame(this);auto* powerLayout=new QVBoxLayout(powerFrame);powerLayout->setContentsMargins(0,0,0,0);
++        auto* power=new QPushButton("POWER",powerFrame);power->setObjectName("ShortcutPower");
++        powerLayout->addWidget(power);powerFrame->setFixedHeight(rx3ui::S(30));titleRow->insertWidget(titleRow->count()-1,powerFrame);
++        connect(power,&QPushButton::clicked,this,[this]{openPower();});
++        Row powerRow;powerRow.key="power_menu";powerRow.frame=powerFrame;powerRow.buttons={power};m_rows.push_back(powerRow);
+         Row closeRow;closeRow.key="close";closeRow.frame=closeFrame;closeRow.buttons={close};m_rows.push_back(closeRow);
+         section(right,"MIXER SETTING");
+         auto* mixerTop=new QHBoxLayout;right->addLayout(mixerTop);
+@@ -285,12 +291,17 @@ class WRx3Shortcut : public QFrame {
+         } else m_focused=std::clamp(m_focused+ticks,0,int(m_rows.size())-1);
+         refresh();
+     }
++    void openPower() {
++        setVisibleControl(false);
++        ControlObject::set(ConfigKey("[RX3Browser]","power"),1);ControlObject::set(ConfigKey("[RX3Browser]","power"),0);
++    }
+     void openTools() {
+         setVisibleControl(false);
+         ControlObject::set(ConfigKey("[RX3Browser]","tools"),1);ControlObject::set(ConfigKey("[RX3Browser]","tools"),0);
+     }
+     void enter() {
+         if(m_rows[m_focused].key=="browser_tools") {openTools();return;}
++        if(m_rows[m_focused].key=="power_menu") {openPower();return;}
+         if(m_rows[m_focused].key=="close") {setVisibleControl(false);return;}
+         if(m_rows[m_focused].key=="usb_save") {saveSettings();return;}
+         if(m_rows[m_focused].key=="usb_load") {loadSettings();return;}
+diff --git a/src/widget/wrx3toolmenu.h b/src/widget/wrx3toolmenu.h
+index 95b5782..8d63dfe 100644
+--- a/src/widget/wrx3toolmenu.h
++++ b/src/widget/wrx3toolmenu.h
+@@ -2,6 +2,7 @@
+ 
+ #include "widget/rx3ui.h"
+ 
++#include <QColor>
+ #include <QLabel>
+ #include <QListWidget>
+ #include <QPushButton>
+@@ -22,6 +23,8 @@ class WRx3ToolMenu : public QWidget {
+         std::function<void()> execute;
+         std::function<void(int)> adjust;
+         std::function<void(bool)> editState{};
++        // Optional text colour (track colour pickers).
++        std::function<QColor()> tint{};
+     };
+     explicit WRx3ToolMenu(QWidget* parent) : QWidget(parent) {
+         setObjectName("RX3BrowserTools");
+@@ -41,7 +44,10 @@ class WRx3ToolMenu : public QWidget {
+         finishEditing();
+         m_actions=std::move(actions);m_back=std::move(back);m_editing=false;
+         m_title->setText(std::move(title));m_list->clear();
+-        for (const auto& action:m_actions) m_list->addItem(action.label());
++        for (const auto& action:m_actions) {
++            m_list->addItem(action.label());
++            if(action.tint) m_list->item(m_list->count()-1)->setForeground(action.tint());
++        }
+         setFocusIndex(0);
+         message("Turn to select · Press to open or edit · Hold to go back");
+     }
+@@ -67,7 +73,12 @@ class WRx3ToolMenu : public QWidget {
+         const auto back=m_back;if(back) back();
+     }
+     void message(const QString& text) {m_status->setText(text);}
+-    void refresh() {for(int i=0;i<int(m_actions.size());++i) if(auto* item=m_list->item(i)) item->setText(m_actions[i].label());}
++    void refresh() {
++        for(int i=0;i<int(m_actions.size());++i) if(auto* item=m_list->item(i)) {
++            item->setText(m_actions[i].label());
++            if(m_actions[i].tint) item->setForeground(m_actions[i].tint());
++        }
++    }
+   protected:
+     void hideEvent(QHideEvent* event) override {finishEditing(); QWidget::hideEvent(event);}
+   private:

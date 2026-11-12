@@ -1,0 +1,173 @@
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index 010b605..0eafb27 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -28,6 +28,7 @@
+ #include "library/rekordbox/rekordboxfeature.h"
+ #include "library/trackcollectionmanager.h"
+ #include "library/trackcollection.h"
++#include "library/trackset/crate/crate.h"
+ #include <QPersistentModelIndex>
+ #include <functional>
+ #include <memory>
+@@ -1092,7 +1093,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     void openSourceSection(const QString& section) {
+         if(!prepareSourceNavigation()) return;
+         if(m_storageMode) {
+-            if(section=="TAG LIST") openStorageTagList();
++            if(section=="TAG LIST") openStorageCrates();
+             else if(section=="PLAYLIST") openStoragePlaylists();
+             return;
+         }
+@@ -1334,44 +1335,51 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         auto* collection=manager?manager->internalCollection():nullptr;
+         return collection?&collection->getPlaylistDAO():nullptr;
+     }
+-    // STORAGE has no rekordbox tag list: TAG LIST is an ordinary Mixxx playlist
+-    // of that name (at most 100 tracks, like the USB tag list).
+-    static inline const QString kStorageTagList=QStringLiteral("TAG LIST");
+-    QString toggleStorageTag() {
+-        auto* dao=storagePlaylists();
+-        if(!dao || !m_toolTrack || !m_toolTrack->getId().isValid()) return QStringLiteral("Select a STORAGE track first.");
+-        int id=dao->getPlaylistIdFromName(kStorageTagList);
+-        if(id<0) id=dao->createPlaylist(kStorageTagList);
+-        if(id<0) return QStringLiteral("TAG LIST could not be created.");
++    // STORAGE has no rekordbox tag list: its TAG LIST button opens the Mixxx
++    // crates, and UTILITY > TAG LIST / TAG TRACK adds or removes the selected
++    // track from a crate. There is no track limit.
++    TrackCollection* storageCollection() const {
++        auto* manager=m_backend?m_backend->trackCollectionManager():nullptr;
++        return manager?manager->internalCollection():nullptr;
++    }
++    QList<Crate> storageCrates() const {
++        QList<Crate> list;
++        if(auto* collection=storageCollection()) {
++            auto result=collection->crates().selectCrates();
++            Crate crate;
++            while(result.populateNext(&crate)) list.append(crate);
++        }
++        return list;
++    }
++    QString toggleStorageCrate(CrateId crateId,const QString& name,bool locked) {
++        auto* collection=storageCollection();
++        if(!collection || !m_toolTrack || !m_toolTrack->getId().isValid()) return QStringLiteral("Select a STORAGE track first.");
++        if(locked) return QString("Crate %1 is locked.").arg(name);
+         const TrackId trackId=m_toolTrack->getId();
+-        if(dao->isTrackInPlaylist(trackId,id)) dao->removeTracksFromPlaylistById(id,trackId);
+-        else if(dao->tracksInPlaylist(id)>=100) return QStringLiteral("TAG LIST is full (100 tracks).");
+-        else dao->appendTrackToPlaylist(trackId,id);
+-        return QString("TAG LIST: %1 / 100 tracks").arg(dao->tracksInPlaylist(id));
+-    }
+-    void clearStorageTag() {
+-        auto* dao=storagePlaylists();
+-        const int id=dao?dao->getPlaylistIdFromName(kStorageTagList):-1;
+-        if(id>=0) dao->deletePlaylist(id);
+-        m_tools->message("TAG LIST cleared.");
+-    }
+-    void openStorageTagList() {
+-        auto* dao=storagePlaylists();
+-        const auto feature=featureIndex("playlist");
+-        const int id=dao?dao->getPlaylistIdFromName(kStorageTagList):-1;
+-        QModelIndex list;
+-        for(int row=0;id>=0 && feature.isValid() && row<model()->rowCount(feature);++row) {
+-            const auto child=model()->index(row,0,feature);
+-            if(child.data().toString()==kStorageTagList) {list=child;break;}
+-        }
+-        m_pages->setCurrentIndex(0);m_selectedCategory=kStorageTagList;
+-        m_search->hide();m_searchRail->hide();m_keyboard->hide();m_searchCount->hide();m_categories->hide();m_breadcrumb->show();
+-        if(!list.isValid()) {
+-            showNotice(QStringLiteral("TAG LIST is empty. Add tracks from UTILITY > BROWSER > TAG LIST / TAG TRACK."));
+-            m_breadcrumb->setText("TAG LIST");return;
+-        }
+-        m_sidebar->setRootIndex(feature);
+-        activate(list);showTrackList(BrowserLevel::Categories);m_breadcrumb->setText("TAG LIST");
++        bool present=false;
++        {
++            auto result=collection->crates().selectCrateTracksSorted(crateId);
++            while(result.next()) if(result.trackId()==trackId) {present=true;break;}
++        }
++        const QList<TrackId> ids{trackId};
++        if(present) return collection->removeCrateTracks(crateId,ids)?
++                QString("Removed from crate %1.").arg(name):QStringLiteral("Crate update failed.");
++        return collection->addCrateTracks(crateId,ids)?
++                QString("Added to crate %1.").arg(name):QStringLiteral("Crate update failed.");
++    }
++    void showStorageCrateTools() {
++        std::vector<ToolAction> actions;
++        const auto crates=storageCrates();
++        for(const auto& crate:crates) {
++            const CrateId id=crate.getId();const QString name=crate.getName();const bool locked=crate.isLocked();
++            actions.push_back(toolAction(locked?name+"  (locked)":name,
++                    [this,id,name,locked]{m_tools->message(toggleStorageCrate(id,name,locked));}));
++        }
++        actions.push_back(toolAction("OPEN CRATES",[this]{openStorageCrates();}));
++        m_tools->showMenu("CRATES / TAG TRACK",std::move(actions),[this]{showTools();});
++        m_tools->message(crates.isEmpty()?
++                QStringLiteral("No crates yet. Create one in the Mixxx Crates view first."):
++                QStringLiteral("Press a crate to add or remove the selected track."));
+     }
+     void openStorageSearch() {
+         const QModelIndex tracks=featureIndex("tracks");
+@@ -1383,22 +1391,24 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_breadcrumb->setText("⌕");m_trackInfo->show();updateTrackInfo();
+         m_search->setFocus();
+     }
+-    void openStoragePlaylists() {
+-        const auto feature=featureIndex("playlist");
++    void openStorageTrackSet(const QString& iconName,const QString& category) {
++        const auto feature=featureIndex(iconName);
+         if(!feature.isValid()) return;
+         m_storageRoot=QPersistentModelIndex(feature);
+-        m_selectedCategory="PLAYLIST";m_search->clear();
++        m_selectedCategory=category;m_search->clear();
+         m_pages->setCurrentIndex(0);m_keyboard->hide();m_search->hide();m_searchRail->hide();m_searchCount->hide();
+         m_categories->hide();m_trackInfo->hide();m_loading->hide();m_breadcrumb->show();
+         m_leftColumn->show();m_level=BrowserLevel::Hierarchy;
+         m_facets->hide();m_library->hide();m_sidebar->setRootIndex(feature);
+         m_emptySpace->hide();m_preview->show();
+-        m_sidebar->show();m_leftHeader->setText("PLAYLIST");m_breadcrumb->setText("STORAGE / PLAYLIST");
++        m_sidebar->show();m_leftHeader->setText(category);m_breadcrumb->setText("STORAGE / "+category);
+         m_focus=NavigationTarget::Tree;m_sidebar->setFocus();
+         if(model()->rowCount(feature)>0) m_sidebar->selectIndex(model()->index(0,0,feature));
+         updatePlaylistPreview();refreshTable();
+         QTimer::singleShot(0,this,[this]{fitBrowseRows();});
+     }
++    void openStoragePlaylists() {openStorageTrackSet("playlist","PLAYLIST");}
++    void openStorageCrates() {openStorageTrackSet("crates","CRATES");}
+     void chooseStorage() {
+         // Show the Mixxx library (the "tracks" feature). Rekordbox state is
+         // cleared so USB-only helpers never act on a stale device.
+diff --git a/src/widget/wrx3browsertools.h b/src/widget/wrx3browsertools.h
+index 02be7d7..67286af 100644
+--- a/src/widget/wrx3browsertools.h
++++ b/src/widget/wrx3browsertools.h
+@@ -26,9 +26,9 @@ inline void WRx3Browser::toolTracks(const QList<quint32>& ids,const QString& nam
+     showTrackList(BrowserLevel::Categories);m_breadcrumb->setText(name);
+ }
+ inline void WRx3Browser::showTagTools() {
++    if(m_storageMode) {showStorageCrateTools();return;}
+     m_tools->showMenu("TAG LIST",{
+         toolAction("ADD / REMOVE SELECTED TRACK",[this]{
+-            if(m_storageMode) {m_tools->message(toggleStorageTag());return;}
+             const auto key=tagIdentity();
+             if(key.isEmpty() || !m_toolTrack || m_toolTrack->getSourceBinding().sourceType()!=mixxx::SourceType::RekordboxUsb) {
+                 m_tools->message("Select an exported track on this USB first.");return;
+@@ -37,15 +37,9 @@ inline void WRx3Browser::showTagTools() {
+             if(binding.sessionIdentifier().uuid().toString()!=key) {m_tools->message("Selected track belongs to a different USB session.");return;}
+             const bool changed=m_tagLists[key].toggle(binding.rekordboxId());
+             m_tools->message(changed?QString("TAG LIST: %1 / 100 tracks").arg(m_tagLists[key].ids().size()):"TAG LIST is full (100 tracks).");}),
+-        toolAction("OPEN TAG LIST",[this]{
+-            if(m_storageMode) {openStorageTagList();return;}
+-            toolTracks(m_tagLists.value(tagIdentity()).ids(),"TAG LIST");}),
+-        toolAction("CREATE PLAYLIST ON USB",[this]{
+-            if(m_storageMode) {m_tools->message("On STORAGE the TAG LIST is already a playlist. Open PLAYLIST to see it.");return;}
+-            saveTagPlaylist();}),
+-        toolAction("CLEAR TAG LIST",[this]{
+-            if(m_storageMode) {clearStorageTag();return;}
+-            m_tagLists[tagIdentity()].clear();m_tools->message("TAG LIST cleared.");})
++        toolAction("OPEN TAG LIST",[this]{toolTracks(m_tagLists.value(tagIdentity()).ids(),"TAG LIST");}),
++        toolAction("CREATE PLAYLIST ON USB",[this]{saveTagPlaylist();}),
++        toolAction("CLEAR TAG LIST",[this]{m_tagLists[tagIdentity()].clear();m_tools->message("TAG LIST cleared.");})
+     },[this]{showTools();});
+ }
+ inline void WRx3Browser::saveTagPlaylist() {

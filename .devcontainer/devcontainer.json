@@ -1,0 +1,7 @@
+{
+  "name": "NauticMixxx cross-build for Raspberry Pi 3B (aarch64)",
+  "build": { "dockerfile": "Dockerfile", "args": { "DEBIAN_RELEASE": "trixie" } },
+  "hostRequirements": { "cpus": 4 },
+  "remoteUser": "root",
+  "postCreateCommand": "aarch64-linux-gnu-g++ --version | head -1 && echo 'Ready. Build with: ./scripts/cross-build-pi3.sh'"
+}

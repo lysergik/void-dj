@@ -1,0 +1,194 @@
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index b8e46dc..bacbc57 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -674,6 +674,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     }
+     void updateFacetPreview() {
+         if(m_level!=BrowserLevel::FacetValues || !m_facets->currentItem()) return;
++        if(m_facetField.startsWith("storage:")) {updateStorageFacetPreview();return;}
+         const auto value=m_facets->currentItem()->text();
+         if(m_facetField=="folder") {
+             QStringList rows;
+@@ -846,6 +847,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     }
+     void selectCategory(int row) {
+         if(m_detailedInfo->isVisible()) ControlObject::set(ConfigKey("[RX3Info]","visible"),0);
++        if(m_storageMode) {selectStorageCategory(row);return;}
+         if(row<0 || row>=m_categoryIds.size() || !m_selectedDevice.isValid()) return;
+         if(deviceStatus(m_selectedDevice)!="ready" || !catalog()) {
+             showSources();
+@@ -1002,6 +1004,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     void chooseFacet() {
+         if(!m_facets->currentItem()) return;
+         const auto value=m_facets->currentItem()->text();
++        if(m_facetField.startsWith("storage:")) {showStorageFacetTracks(value);return;}
+ 
+         if(m_facetField=="folder") {
+             const QString path=m_folderPaths.value(value);
+@@ -1412,6 +1415,121 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+                 QStringLiteral("No crates yet. NEW CRATE: TAG LIST starts one with the selected track."):
+                 QStringLiteral("Press a crate to add or remove the selected track."));
+     }
++    // The STORAGE left panel mirrors the USB category panel.
++    static QStringList storageCategories() {
++        return {"ARTIST","ALBUM","TRACK","KEY","GENRE","PLAYLIST","TAG LIST","HISTORY","MATCHING","FOLDER","SEARCH","DATE ADDED"};
++    }
++    void showStorageRail(const QString& select) {
++        const auto labels=storageCategories();
++        if(m_categories->count()!=labels.size() || m_categories->item(0)->text().section('\n',1)!=labels.first()) {
++            m_categories->clear();m_categoryIds.clear();
++            for(int i=0;i<labels.size();++i) {
++                auto* item=new QListWidgetItem("\n"+labels[i],m_categories);
++                item->setTextAlignment(Qt::AlignCenter);item->setSizeHint(QSize(rx3ui::S(94),rx3ui::S(65)));
++                m_categoryIds.append(quint16(i+1));
++            }
++        }
++        m_categories->setCurrentRow(labels.indexOf(select));m_categories->show();
++        QTimer::singleShot(0,this,[this]{fitBrowseRows();});
++    }
++    void selectStorageCategory(int row) {
++        if(row<0 || row>=m_categories->count()) return;
++        const QString label=m_categories->item(row)->text().section('\n',1);
++        m_pendingFolderTrack.clear();
++        if(label=="TRACK") {chooseStorage();return;}
++        if(label=="PLAYLIST") {openStoragePlaylists();return;}
++        if(label=="TAG LIST") {openStorageCrates();return;}
++        if(label=="SEARCH") {openStorageSearch();return;}
++        if(label=="HISTORY") {openStorageTrackSet("history","HISTORY");return;}
++        if(label=="FOLDER") {openStorageTrackSet("computer","FOLDER");return;}
++        if(label=="MATCHING") {showStorageMatching();return;}
++        if(label=="DATE ADDED") {showStorageFacet(label,"date_added");return;}
++        if(label=="ARTIST") showStorageFacet(label,"artist");
++        else if(label=="ALBUM") showStorageFacet(label,"album");
++        else if(label=="GENRE") showStorageFacet(label,"genre");
++        else if(label=="KEY") showStorageFacet(label,"key");
++    }
++    // date_added groups tracks by calendar day of datetime_added.
++    static QString storageFacetExpr(const QString& column) {
++        return column=="date_added"?QStringLiteral("date(datetime_added)"):column;
++    }
++    void showStorageMatching() {
++        m_selectedCategory="MATCHING";m_facetField="storage:matching";m_facets->clear();
++        m_search->clear();m_library->search(QString());
++        m_keyboard->hide();m_search->hide();m_searchRail->hide();m_searchCount->hide();m_breadcrumb->show();
++        m_trackInfo->hide();m_loading->hide();m_pages->setCurrentIndex(0);
++        m_facets->addItems({"DECK 1","DECK 2"});
++        m_level=BrowserLevel::FacetValues;m_leftColumn->show();m_sidebar->hide();m_library->hide();
++        m_emptySpace->hide();m_facets->show();m_preview->show();m_leftHeader->setText("DECK");
++        m_breadcrumb->setText("STORAGE / MATCHING");setPreview("TRACK",{});
++        m_facets->setCurrentRow(0);m_focus=NavigationTarget::Facets;m_facets->setFocus();
++        QTimer::singleShot(0,this,[this]{fitBrowseRows();});
++    }
++    // Same rule as the USB MATCHING: compatible key and tempo within six percent.
++    QString storageMatchingQuery(int deck) const {
++        const auto track=PlayerInfo::instance().getTrackInfo(QString("[Channel%1]").arg(deck));
++        if(!track) return {};
++        QStringList terms;
++        const QString key=track->getKeyText();
++        if(!key.isEmpty()) terms<<QString("~key:%1").arg(key);
++        const double bpm=track->getBpm();
++        if(bpm>0) terms<<QString("bpm:%1-%2").arg(bpm*0.94,0,'f',1).arg(bpm*1.06,0,'f',1);
++        return terms.join(' ');
++    }
++    void showStorageFacet(const QString& label,const QString& column) {
++        auto* collection=storageCollection();
++        if(!collection) return;
++        m_selectedCategory=label;m_facetField="storage:"+column;m_facetTracks.clear();m_facets->clear();
++        m_search->clear();m_library->search(QString());
++        m_keyboard->hide();m_search->hide();m_searchRail->hide();m_searchCount->hide();m_breadcrumb->show();
++        m_trackInfo->hide();m_loading->hide();m_pages->setCurrentIndex(0);
++        QSqlQuery query(collection->database());
++        const QString expr=storageFacetExpr(column);
++        query.prepare(QString("SELECT DISTINCT %1 FROM library WHERE mixxx_deleted=0 AND %1<>'' "
++                "ORDER BY %1 %2").arg(expr,column=="date_added"?QStringLiteral("DESC"):QStringLiteral("COLLATE NOCASE")));
++        if(query.exec()) while(query.next()) {
++            auto* item=new QListWidgetItem(query.value(0).toString(),m_facets);
++            item->setSizeHint(QSize(rx3ui::S(260),rx3ui::S(44)));
++        }
++        m_level=BrowserLevel::FacetValues;m_leftColumn->show();m_sidebar->hide();m_library->hide();
++        m_emptySpace->hide();m_facets->show();m_preview->show();m_leftHeader->setText(label);
++        m_breadcrumb->setText("STORAGE / "+label);
++        m_focus=NavigationTarget::Facets;
++        if(m_facets->count()) m_facets->setCurrentRow(0);
++        else setPreview("TRACK",{});
++        m_facets->setFocus();updateFacetPreview();refreshTable();
++        QTimer::singleShot(0,this,[this]{fitBrowseRows();});
++    }
++    void updateStorageFacetPreview() {
++        auto* collection=storageCollection();
++        if(!collection || !m_facets->currentItem()) {setPreview("TRACK",{});return;}
++        const QString column=m_facetField.section(':',1);
++        if(column=="matching") {setPreview("TRACK",{});return;}
++        QSqlQuery query(collection->database());
++        query.prepare(QString("SELECT title FROM library WHERE mixxx_deleted=0 AND %1=:value "
++                "ORDER BY title COLLATE NOCASE LIMIT 200").arg(storageFacetExpr(column)));
++        query.bindValue(":value",m_facets->currentItem()->text());
++        QStringList rows;
++        if(query.exec()) while(query.next()) rows.append(query.value(0).toString());
++        setPreview("TRACK",rows);
++    }
++    void showStorageFacetTracks(const QString& value) {
++        const QModelIndex tracks=featureIndex("tracks");
++        if(!tracks.isValid()) return;
++        const QString column=m_facetField.section(':',1);
++        QString text=value;text.replace('"',' ');
++        QString query=QString("%1:=\"%2\"").arg(column,text);
++        if(column=="date_added") query=QString("added:%1").arg(text);
++        if(column=="matching") {
++            query=storageMatchingQuery(value.endsWith('2')?2:1);
++            if(query.isEmpty()) {m_breadcrumb->setText("STORAGE / MATCHING / "+value+" (no track, key or BPM)");return;}
++        }
++        model()->clicked(tracks);
++        m_search->setText(query);
++        m_breadcrumb->setText("STORAGE / "+m_selectedCategory+" / "+value);
++        showTrackList(BrowserLevel::FacetValues);
++        m_trackInfo->show();updateTrackInfo();
++    }
+     void openStorageSearch() {
+         const QModelIndex tracks=featureIndex("tracks");
+         if(!tracks.isValid()) return;
+@@ -1428,7 +1546,8 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_storageRoot=QPersistentModelIndex(feature);
+         m_selectedCategory=category;m_search->clear();
+         m_pages->setCurrentIndex(0);m_keyboard->hide();m_search->hide();m_searchRail->hide();m_searchCount->hide();
+-        m_categories->hide();m_trackInfo->hide();m_loading->hide();m_breadcrumb->show();
++        showStorageRail(iconName=="crates"?"TAG LIST":category);
++        m_trackInfo->hide();m_loading->hide();m_breadcrumb->show();
+         m_leftColumn->show();m_level=BrowserLevel::Hierarchy;
+         m_facets->hide();m_library->hide();m_sidebar->setRootIndex(feature);
+         m_emptySpace->hide();m_preview->show();
+@@ -1448,9 +1567,9 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_storageMode=true;m_search->clear();
+         m_selectedDevice=QPersistentModelIndex();m_currentRoot.clear();
+         qApp->setProperty("rx3SettingsUsbRoot",QString());
+-        m_categories->clear();m_categoryIds.clear();
+         m_pages->setCurrentIndex(0);m_source->setText("SOURCE");
+-        m_keyboard->hide();m_search->hide();m_searchRail->hide();m_categories->hide();
++        m_keyboard->hide();m_search->hide();m_searchRail->hide();showStorageRail("TRACK");
++        m_library->search(QString());
+         m_breadcrumb->show();m_searchCount->hide();m_trackInfo->show();
+         m_sourceActionIndex=-1;updateSourceActionHighlight();updateSourceAppearance();
+         m_selectedCategory="STORAGE";m_pendingFolderTrack.clear();
+@@ -1539,14 +1658,16 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+             updateSourceActionHighlight();updateSourceAppearance();focusTracks();return;
+         }
+         if(m_storageMode && m_pages->currentIndex()==0) {
++            if(m_focus==NavigationTarget::Categories) {showSources();return;}
+             const bool playlistRoot=m_level==BrowserLevel::Hierarchy && m_storageRoot.isValid() &&
+                     m_sidebar->rootIndex()==QModelIndex(m_storageRoot);
+-            if(m_selectedCategory=="SEARCH" || playlistRoot || m_level==BrowserLevel::Notice ||
+-                    (m_level==BrowserLevel::Tracks && m_returnLevel==BrowserLevel::Categories && m_selectedCategory!="STORAGE")) {
+-                chooseStorage();return;
++            if(m_selectedCategory=="SEARCH") {chooseStorage();return;}
++            if(playlistRoot || m_level==BrowserLevel::Notice || m_level==BrowserLevel::FacetValues ||
++                    (m_level==BrowserLevel::Tracks && m_returnLevel==BrowserLevel::Categories)) {
++                previewCategory(m_categories->currentRow());return;
+             }
+-            if(m_selectedCategory=="STORAGE") {showSources();return;}
+-            // Inside a playlist: use the normal hierarchy navigation below.
++            // Inside a playlist or facet value: use the normal navigation below.
++            if(m_level==BrowserLevel::Tracks && m_returnLevel==BrowserLevel::FacetValues) m_search->clear();
+         }
+         if(m_focus==NavigationTarget::Source) {
+             if(!deviceReady(m_selectedDevice)) return;

@@ -1,0 +1,16 @@
+diff --git a/src/preferences/settingsmanager.cpp b/src/preferences/settingsmanager.cpp
+index cfee02f..ec28591 100644
+--- a/src/preferences/settingsmanager.cpp
++++ b/src/preferences/settingsmanager.cpp
+@@ -75,7 +75,10 @@ void applyNauticUsbPolicy(const UserSettingsPointer& settings) {
+     const auto set = [&settings](const char* group, const char* key, int value) {
+         settings->setValue(ConfigKey(group, key), value);
+     };
+-    set("[Library]", "UsbOnlyMode", 1);
++    // STORAGE (patch 0046): the local Mixxx library is a first-class source,
++    // so local music folders and library scans are allowed again. Rekordbox
++    // USB sources keep their own read-only track policy.
++    set("[Library]", "UsbOnlyMode", 0);
+     set("[Library]", "RescanOnStartup", 0);
+     set("[Library]", "EnableWaveformCaching", 0);
+     set("[Library]", "EnableWaveformGenerationWithAnalysis", 0);

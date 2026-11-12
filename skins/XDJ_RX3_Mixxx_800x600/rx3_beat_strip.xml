@@ -1,0 +1,7 @@
+<Template>
+  <WidgetGroup>
+    <ObjectName>RX3BeatStrip</ObjectName><Layout>horizontal</Layout><Size>0me,58f</Size>
+    
+    <Children />
+  </WidgetGroup>
+</Template>

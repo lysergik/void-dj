@@ -1,0 +1,84 @@
+diff --git a/src/library/mixman/mixmanstick.h b/src/library/mixman/mixmanstick.h
+index 9b86ac3..48bb669 100644
+--- a/src/library/mixman/mixmanstick.h
++++ b/src/library/mixman/mixmanstick.h
+@@ -94,6 +94,25 @@ inline QString databasePath(const QString& root) {
+     return candidate;
+ }
+ 
++// A real rekordbox export. It wins over MIXMAN: a stray PIONEER folder (for
++// example one created by a recording) must not hide a MIXMAN stick, and a
++// MIXMAN folder must not hide a genuine rekordbox export.
++inline bool hasRekordboxExport(const QString& root) {
++    if (root.isEmpty()) return false;
++    for (const QString& relative : {QStringLiteral("PIONEER/rekordbox/export.pdb"),
++                 QStringLiteral(".PIONEER/rekordbox/export.pdb")}) {
++        const QFileInfo info(QDir(root).filePath(relative));
++        if (info.isFile()) return true;
++    }
++    return false;
++}
++
++// True when the stick is a mixman export: MIXMAN/library.sqlite and no
++// rekordbox export.pdb. The presence of a PIONEER folder is irrelevant.
++inline bool isMixmanStick(const QString& root) {
++    return !databasePath(root).isEmpty() && !hasRekordboxExport(root);
++}
++
+ inline QString analysisFilePath(const QString& root, qint64 id) {
+     return QDir(root).filePath(QStringLiteral("MIXMAN/analysis/") + QString::number(id));
+ }
+diff --git a/src/library/rekordbox/rekordboxusbsession.cpp b/src/library/rekordbox/rekordboxusbsession.cpp
+index c290b00..40d862a 100644
+--- a/src/library/rekordbox/rekordboxusbsession.cpp
++++ b/src/library/rekordbox/rekordboxusbsession.cpp
+@@ -380,7 +380,7 @@ bool RekordboxUsbSession::load() {
+     for (const auto& name : {QStringLiteral("PIONEER"), QStringLiteral(".PIONEER")}) {
+         recognized |= QFileInfo::exists(QDir(root).filePath(name));
+     }
+-    const bool mixman = !recognized && !mixxx::mixman::databasePath(root).isEmpty();
++    const bool mixman = mixxx::mixman::isMixmanStick(root);
+     if (!recognized && !mixman) {
+         return fail(UsbSessionState::Error, UsbSessionError::NotRekordbox, QStringLiteral("No Rekordbox structure"));
+     }
+diff --git a/src/widget/wrx3browsermixman.h b/src/widget/wrx3browsermixman.h
+index ae58650..179d9d8 100644
+--- a/src/widget/wrx3browsermixman.h
++++ b/src/widget/wrx3browsermixman.h
+@@ -14,11 +14,10 @@
+ #include "track/track.h"
+ #include "util/color/rgbcolor.h"
+ 
+-// A stick written by mixman has MIXMAN/library.sqlite and no PIONEER folder.
++// A stick written by mixman has MIXMAN/library.sqlite and no rekordbox
++// export.pdb. A PIONEER folder alone (recordings, settings) does not matter.
+ inline bool WRx3Browser::isMixmanRoot(const QString& root) const {
+-    return !root.isEmpty() && !QFileInfo(QDir(root).filePath("PIONEER")).exists() &&
+-            !QFileInfo(QDir(root).filePath(".PIONEER")).exists() &&
+-            !mixxx::mixman::databasePath(root).isEmpty();
++    return mixxx::mixman::isMixmanStick(root);
+ }
+ 
+ // Roots of the connected sources that are mixman sticks.
+diff --git a/src/widget/wrx3browsertools.h b/src/widget/wrx3browsertools.h
+index fa7868e..f6bc9e6 100644
+--- a/src/widget/wrx3browsertools.h
++++ b/src/widget/wrx3browsertools.h
+@@ -195,7 +195,7 @@ inline void WRx3Browser::showRecordingTools() {
+             if(ControlObject::get(ConfigKey("[Recording]","status"))>0) {m_tools->message("A recording is already active.");return;}
+             rx3::UsbStorageInfo storage(m_currentRoot);storage.refresh();
+             if(!storage.isReady() || storage.isReadOnly() || storage.bytesAvailable()<=1024LL*1024*1024) {m_tools->message("USB unavailable, read-only or less than 1 GiB free.");return;}
+-            const auto directory=QDir(m_currentRoot).filePath("PIONEER/REC");
++            const auto directory=QDir(m_currentRoot).filePath(isMixmanRoot(m_currentRoot)?"MIXMAN/REC":"PIONEER/REC");
+             if(!QDir().mkpath(directory) || QFileInfo(directory).isSymLink() || !QFileInfo(directory).canonicalFilePath().startsWith(QFileInfo(m_currentRoot).canonicalFilePath()+"/")) {m_tools->message("Unable to create the USB recording folder.");return;}
+             m_recordingRoot=m_currentRoot;m_recordingDevice=QString::fromLatin1(storage.device().toHex());
+             m_config->setValue(ConfigKey("[Recording]","Directory"),directory);m_config->setValue(ConfigKey("[Recording]","Encoding"),QString("WAV"));
+@@ -207,7 +207,7 @@ inline void WRx3Browser::showRecordingTools() {
+         toolAction("SPLIT — START NEXT RECORDING FILE",[]{ControlObject::set(ConfigKey("[Recording]","rx3_split"),1);ControlObject::set(ConfigKey("[Recording]","rx3_split"),0);}),
+         toolAction("OPEN USB RECORDINGS",[this]{
+             if(!catalog()) {m_tools->message("Select a USB first.");return;}
+-            m_pages->setCurrentIndex(0);m_selectedCategory="REC";showFolder(QDir(m_currentRoot).filePath("PIONEER/REC"));}),
++            m_pages->setCurrentIndex(0);m_selectedCategory="REC";showFolder(QDir(m_currentRoot).filePath(isMixmanRoot(m_currentRoot)?"MIXMAN/REC":"PIONEER/REC"));}),
+         {[this]{rx3::UsbStorageInfo storage(m_recordingRoot.isEmpty()?m_currentRoot:m_recordingRoot);const auto seconds=qRound(ControlObject::get(ConfigKey("[Recording]","rx3_seconds")));return QString("REC: %1 · %2:%3 · FREE: %4 MiB").arg(ControlObject::get(ConfigKey("[Recording]","status"))>0?"ON":"OFF").arg(seconds/60,2,10,QChar('0')).arg(seconds%60,2,10,QChar('0')).arg(storage.bytesAvailable()/1024/1024);},{},{}}
+     },[this]{showTools();});
+ }

@@ -1,0 +1,937 @@
+diff --git a/src/library/mixman/mixmanstick.h b/src/library/mixman/mixmanstick.h
+new file mode 100644
+index 0000000..9199383
+--- /dev/null
++++ b/src/library/mixman/mixmanstick.h
+@@ -0,0 +1,290 @@
++#pragma once
++
++// Reader for sticks written by the `mixman` exporter (see FORMAT.md of mixman):
++//
++//   <stick>/MIXMAN/library.sqlite   Mixxx-schema subset + meta table
++//   <stick>/MIXMAN/analysis/<id>    Mixxx waveform analysis files
++//   <stick>/MIXMAN/Contents/...     audio (track_locations.location is relative to the stick)
++//
++// The database is only ever opened read-only. Everything here is plain value
++// data so the same reader serves the SOURCE catalog (browse/load from the
++// stick) and the importer (copy into the STORAGE library).
++
++#include <QByteArray>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QList>
++#include <QSqlDatabase>
++#include <QSqlError>
++#include <QSqlQuery>
++#include <QSqlRecord>
++#include <QString>
++#include <QUuid>
++#include <QVariant>
++
++#include <optional>
++
++namespace mixxx::mixman {
++
++constexpr int kSupportedFormatVersion = 1;
++
++struct Cue {
++    int type{0};          // Mixxx CueType numbering (1 hot cue, 2 main cue, 4 loop, ...)
++    double position{0};   // engine samples (frames * 2)
++    double length{0};     // engine samples
++    int hotcue{-1};
++    QString label;
++    std::optional<quint32> color;
++};
++
++struct Analysis {
++    qint64 id{0};
++    int type{0};          // 1 waveform, 2 summary
++    QString description;
++    QString version;
++    qint64 checksum{0};
++};
++
++struct Track {
++    qint64 id{0};
++    QString artist, title, album, albumArtist, genre, year, comment, composer, grouping, key;
++    double bpm{0};
++    double duration{0};
++    int samplerate{0};
++    int rating{0};
++    bool bpmLocked{false};
++    std::optional<quint32> color;
++    double mainCue{-1};   // engine samples
++    QString relativePath; // relative to the stick root, forward slashes
++    qint64 fileSize{0};
++    QByteArray beats;
++    QString beatsVersion;
++    QString beatsSubVersion;
++    QList<Cue> cues;
++    QList<Analysis> analyses;
++};
++
++struct List {
++    qint64 id{0};
++    QString name;
++    QList<qint64> trackIds; // in order
++};
++
++struct Stick {
++    QString root;
++    QString databasePath;
++    QString exportId;
++    qint64 createdUnix{0};
++    QList<Track> tracks;
++    QList<List> crates;
++    QList<List> playlists;
++};
++
++// `MIXMAN/library.sqlite` inside the stick root, or an empty string.
++inline QString databasePath(const QString& root) {
++    if (root.isEmpty()) return {};
++    const QString candidate = QDir(root).filePath(QStringLiteral("MIXMAN/library.sqlite"));
++    const QFileInfo info(candidate);
++    if (!info.isFile() || info.isSymLink()) return {};
++    const QString canonicalRoot = QFileInfo(root).canonicalFilePath();
++    const QString canonical = info.canonicalFilePath();
++    if (canonicalRoot.isEmpty() || !canonical.startsWith(canonicalRoot + QLatin1Char('/'))) return {};
++    return candidate;
++}
++
++inline QString analysisFilePath(const QString& root, qint64 id) {
++    return QDir(root).filePath(QStringLiteral("MIXMAN/analysis/") + QString::number(id));
++}
++
++namespace detail {
++inline QString text(const QSqlRecord& r, const char* column) {
++    const int i = r.indexOf(QLatin1String(column));
++    return i < 0 || r.isNull(i) ? QString() : r.value(i).toString();
++}
++inline double number(const QSqlRecord& r, const char* column, double fallback = 0) {
++    const int i = r.indexOf(QLatin1String(column));
++    return i < 0 || r.isNull(i) ? fallback : r.value(i).toDouble();
++}
++inline qint64 integer(const QSqlRecord& r, const char* column, qint64 fallback = 0) {
++    const int i = r.indexOf(QLatin1String(column));
++    return i < 0 || r.isNull(i) ? fallback : r.value(i).toLongLong();
++}
++inline std::optional<quint32> rgb(const QSqlRecord& r, const char* column) {
++    const int i = r.indexOf(QLatin1String(column));
++    if (i < 0 || r.isNull(i)) return std::nullopt;
++    const qint64 value = r.value(i).toLongLong();
++    if (value < 0) return std::nullopt;
++    return static_cast<quint32>(value & 0xFFFFFF);
++}
++inline bool tableExists(QSqlDatabase& db, const QString& name) {
++    QSqlQuery q(db);
++    q.prepare(QStringLiteral("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? COLLATE NOCASE"));
++    q.addBindValue(name);
++    return q.exec() && q.next();
++}
++} // namespace detail
++
++// Read the whole export. `error` is set on failure. Safe to call from a worker thread.
++inline bool read(const QString& root, Stick* stick, QString* error) {
++    const QString path = databasePath(root);
++    if (path.isEmpty()) {
++        if (error) *error = QStringLiteral("No MIXMAN export found");
++        return false;
++    }
++    const QString connection = QStringLiteral("rx3-mixman-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
++    bool ok = false;
++    {
++        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
++        db.setDatabaseName(path);
++        db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
++        if (!db.open()) {
++            if (error) *error = db.lastError().text();
++        } else {
++            ok = [&]() -> bool {
++                QSqlQuery q(db);
++                if (!detail::tableExists(db, QStringLiteral("meta")) ||
++                        !q.exec(QStringLiteral("SELECT key, value FROM meta"))) {
++                    if (error) *error = QStringLiteral("Not a MIXMAN export (no meta table)");
++                    return false;
++                }
++                QString format;
++                int version = 0;
++                while (q.next()) {
++                    const QString key = q.value(0).toString();
++                    const QString value = q.value(1).toString();
++                    if (key == QLatin1String("format")) format = value;
++                    else if (key == QLatin1String("format_version")) version = value.toInt();
++                    else if (key == QLatin1String("export_id")) stick->exportId = value;
++                    else if (key == QLatin1String("created_unix")) stick->createdUnix = value.toLongLong();
++                }
++                if (format != QLatin1String("mixman-export")) {
++                    if (error) *error = QStringLiteral("Not a MIXMAN export");
++                    return false;
++                }
++                if (version > kSupportedFormatVersion) {
++                    if (error) *error = QStringLiteral("Export made by a newer mixman (format %1)").arg(version);
++                    return false;
++                }
++                stick->root = root;
++                stick->databasePath = path;
++
++                // tracks
++                if (!q.exec(QStringLiteral(
++                            "SELECT l.*, tl.location AS rel_location, tl.filesize AS rel_filesize "
++                            "FROM library l JOIN track_locations tl ON tl.id = l.location "
++                            "WHERE COALESCE(l.mixxx_deleted, 0) = 0 ORDER BY l.id"))) {
++                    if (error) *error = q.lastError().text();
++                    return false;
++                }
++                while (q.next()) {
++                    const QSqlRecord r = q.record();
++                    Track t;
++                    t.id = detail::integer(r, "id");
++                    t.artist = detail::text(r, "artist");
++                    t.title = detail::text(r, "title");
++                    t.album = detail::text(r, "album");
++                    t.albumArtist = detail::text(r, "album_artist");
++                    t.genre = detail::text(r, "genre");
++                    t.year = detail::text(r, "year");
++                    t.comment = detail::text(r, "comment");
++                    t.composer = detail::text(r, "composer");
++                    t.grouping = detail::text(r, "grouping");
++                    t.key = detail::text(r, "key");
++                    t.bpm = detail::number(r, "bpm");
++                    t.duration = detail::number(r, "duration");
++                    t.samplerate = int(detail::integer(r, "samplerate"));
++                    t.rating = int(detail::integer(r, "rating"));
++                    t.bpmLocked = detail::integer(r, "bpm_lock") != 0;
++                    t.color = detail::rgb(r, "color");
++                    t.mainCue = detail::number(r, "cuepoint", -1);
++                    t.relativePath = detail::text(r, "rel_location");
++                    t.relativePath.replace(QLatin1Char('\\'), QLatin1Char('/'));
++                    t.fileSize = detail::integer(r, "rel_filesize");
++                    const int beats = r.indexOf(QLatin1String("beats"));
++                    if (beats >= 0 && !r.isNull(beats)) t.beats = r.value(beats).toByteArray();
++                    t.beatsVersion = detail::text(r, "beats_version");
++                    t.beatsSubVersion = detail::text(r, "beats_sub_version");
++                    if (t.id <= 0 || t.id > 0x7fffffffLL || t.relativePath.isEmpty()) continue;
++                    stick->tracks.append(std::move(t));
++                }
++                QHash<qint64, int> index;
++                for (int i = 0; i < stick->tracks.size(); ++i) index.insert(stick->tracks[i].id, i);
++
++                // cues
++                if (detail::tableExists(db, QStringLiteral("cues")) &&
++                        q.exec(QStringLiteral("SELECT * FROM cues ORDER BY track_id, hotcue, position"))) {
++                    while (q.next()) {
++                        const QSqlRecord r = q.record();
++                        const auto it = index.constFind(detail::integer(r, "track_id"));
++                        if (it == index.cend()) continue;
++                        Cue c;
++                        c.type = int(detail::integer(r, "type"));
++                        c.position = detail::number(r, "position");
++                        c.length = detail::number(r, "length");
++                        c.hotcue = int(detail::integer(r, "hotcue", -1));
++                        c.label = detail::text(r, "label");
++                        c.color = detail::rgb(r, "color");
++                        stick->tracks[*it].cues.append(std::move(c));
++                    }
++                }
++                // waveform analysis files
++                if (detail::tableExists(db, QStringLiteral("track_analysis")) &&
++                        q.exec(QStringLiteral("SELECT * FROM track_analysis ORDER BY track_id, type"))) {
++                    while (q.next()) {
++                        const QSqlRecord r = q.record();
++                        const auto it = index.constFind(detail::integer(r, "track_id"));
++                        if (it == index.cend()) continue;
++                        Analysis a;
++                        a.id = detail::integer(r, "id");
++                        a.type = int(detail::integer(r, "type"));
++                        a.description = detail::text(r, "description");
++                        a.version = detail::text(r, "version");
++                        a.checksum = detail::integer(r, "data_checksum");
++                        stick->tracks[*it].analyses.append(std::move(a));
++                    }
++                }
++                // crates and playlists
++                const auto readLists = [&](const QString& listSql, const QString& memberTable,
++                                               const QString& listColumn, const QString& order,
++                                               QList<List>* out) {
++                    QSqlQuery lists(db);
++                    if (!lists.exec(listSql)) return;
++                    while (lists.next()) {
++                        List l;
++                        l.id = lists.value(0).toLongLong();
++                        l.name = lists.value(1).toString();
++                        QSqlQuery members(db);
++                        members.prepare(QStringLiteral("SELECT track_id FROM %1 WHERE %2 = ? %3")
++                                                .arg(memberTable, listColumn, order));
++                        members.addBindValue(l.id);
++                        if (members.exec()) {
++                            while (members.next()) {
++                                const qint64 id = members.value(0).toLongLong();
++                                if (index.contains(id)) l.trackIds.append(id);
++                            }
++                        }
++                        out->append(std::move(l));
++                    }
++                };
++                if (detail::tableExists(db, QStringLiteral("crates")) &&
++                        detail::tableExists(db, QStringLiteral("crate_tracks"))) {
++                    readLists(QStringLiteral("SELECT id, name FROM crates ORDER BY name COLLATE NOCASE"),
++                            QStringLiteral("crate_tracks"), QStringLiteral("crate_id"), QString(), &stick->crates);
++                }
++                if (detail::tableExists(db, QStringLiteral("Playlists")) &&
++                        detail::tableExists(db, QStringLiteral("PlaylistTracks"))) {
++                    readLists(QStringLiteral("SELECT id, name FROM Playlists WHERE COALESCE(hidden,0)=0 ORDER BY position, name"),
++                            QStringLiteral("PlaylistTracks"), QStringLiteral("playlist_id"),
++                            QStringLiteral("ORDER BY position"), &stick->playlists);
++                }
++                return true;
++            }();
++            db.close();
++        }
++    }
++    QSqlDatabase::removeDatabase(connection);
++    return ok;
++}
++
++} // namespace mixxx::mixman
+diff --git a/src/library/rekordbox/mixmancatalog.h b/src/library/rekordbox/mixmancatalog.h
+new file mode 100644
+index 0000000..2ab7b07
+--- /dev/null
++++ b/src/library/rekordbox/mixmancatalog.h
+@@ -0,0 +1,206 @@
++#pragma once
++
++// MIXMAN sticks as a SOURCE: the stick is projected into the same runtime
++// catalog as a Rekordbox USB, so browsing (ARTIST/ALBUM/TRACK/KEY/PLAYLIST/
++// MATCHING/FOLDER/SEARCH), deck loading and the read-only rules are shared.
++
++#include <QBuffer>
++#include <QByteArray>
++#include <QFile>
++#include <QJsonObject>
++#include <QSet>
++#include <QtGlobal>
++
++#include "library/mixman/mixmanstick.h"
++#include "library/rekordbox/rekordboxdevice.h"
++#include "library/rekordbox/rekordboxruntimecatalog.h"
++#include "track/beats.h"
++#include "track/beatsimporter.h"
++#include "track/track.h"
++#include "waveform/waveform.h"
++#include "waveform/waveformfactory.h"
++
++namespace mixxx::rekordbox {
++
++constexpr quint32 kMixmanCratesFolderId = 900000;
++constexpr quint32 kMixmanCrateBase = 900001;
++
++inline bool isMixmanTrack(const RuntimeTrack& track) {
++    return track.rawMetadata.value(QStringLiteral("mixman")).toBool();
++}
++
++// Beats stay Mixxx's own serialized grid; the importer decodes them once the
++// decoder's real sample rate is known (same lifecycle as the Rekordbox grid).
++class MixmanBeatsImporter final : public mixxx::BeatsImporter {
++  public:
++    MixmanBeatsImporter(QByteArray blob, QString version, QString subVersion)
++            : m_blob(std::move(blob)), m_version(std::move(version)), m_subVersion(std::move(subVersion)) {}
++    bool isEmpty() const override { return m_blob.isEmpty() || m_version.isEmpty(); }
++    mixxx::BeatsPointer importBeatsAndApplyTimingOffset(const QString&, const QString&,
++            const mixxx::audio::StreamInfo& streamInfo) override {
++        const auto rate = streamInfo.getSignalInfo().getSampleRate();
++        if (isEmpty() || !rate.isValid()) return nullptr;
++        return mixxx::Beats::fromByteArray(rate, m_version, m_subVersion, m_blob);
++    }
++  private:
++    QByteArray m_blob;
++    QString m_version;
++    QString m_subVersion;
++};
++
++inline bool populateMixman(const QString& root, const mixman::Stick& stick,
++        RuntimeCatalog* catalog, QString* error) {
++    BrowseMenu menu;
++    quint16 id = 1;
++    for (const char* label : {"ARTIST", "ALBUM", "TRACK", "KEY", "GENRE", "PLAYLIST", "MATCHING", "FOLDER", "SEARCH"}) {
++        BrowseCategory category;
++        category.id = id;
++        category.label = QString::fromLatin1(label);
++        category.position = id;
++        menu.categories.append(category);
++        ++id;
++    }
++    menu.fromExport = true;
++    catalog->setBrowseMenu(menu);
++
++    for (const auto& source : stick.tracks) {
++        RuntimeTrack track;
++        track.rekordboxId = static_cast<quint32>(source.id);
++        track.title = source.title;
++        track.artist = source.artist;
++        track.album = source.album;
++        track.genre = source.genre;
++        track.comment = source.comment;
++        track.key = source.key;
++        track.composer = source.composer;
++        if (source.bpm > 0) track.bpm = source.bpm;
++        if (source.duration > 0) track.durationSeconds = static_cast<quint32>(source.duration + 0.5);
++        if (source.rating >= 0 && source.rating <= 5) track.rating = static_cast<quint32>(source.rating);
++        track.audioRelativePath = source.relativePath;
++        track.resolvedAudioPath = resolvePath(root, source.relativePath, false);
++        if (track.resolvedAudioPath.isEmpty()) {
++            track.diagnostics.append(QStringLiteral("Unsafe or unresolvable export path: %1").arg(source.relativePath));
++        } else if (!QFileInfo::exists(track.resolvedAudioPath)) {
++            track.diagnostics.append(QStringLiteral("Export file is missing: %1").arg(source.relativePath));
++        }
++        const double rate = source.samplerate > 0 ? source.samplerate : 44100;
++        const auto millis = [rate](double samples) { return samples / 2.0 / rate * 1000.0; };
++        bool hasMain = false;
++        for (const auto& cue : source.cues) {
++            if (cue.position < 0 && cue.type != 2) continue;
++            RuntimeCue runtime;
++            runtime.label = cue.label;
++            if (cue.color) runtime.color = mixxx::RgbColor::optional(mixxx::RgbColor::validateCode(*cue.color));
++            runtime.startMs = millis(cue.position);
++            if (cue.type == 1 && cue.hotcue >= 0) {
++                runtime.kind = RuntimeCue::Kind::HotCue;
++                runtime.hotcueIndex = cue.hotcue + 1;
++            } else if (cue.type == 2) {
++                if (cue.position < 0 || hasMain) continue;
++                hasMain = true;
++                runtime.kind = RuntimeCue::Kind::MemoryCue;
++            } else if (cue.type == 4 && cue.length > 0) {
++                runtime.endMs = millis(cue.position + cue.length);
++                if (cue.hotcue >= 0) {
++                    runtime.kind = RuntimeCue::Kind::HotLoop;
++                    runtime.hotcueIndex = cue.hotcue + 1;
++                } else {
++                    runtime.kind = RuntimeCue::Kind::MemoryLoop;
++                }
++            } else {
++                continue;
++            }
++            track.cues.append(std::move(runtime));
++        }
++        if (!hasMain && source.mainCue > 0) {
++            RuntimeCue main;
++            main.kind = RuntimeCue::Kind::MemoryCue;
++            main.startMs = millis(source.mainCue);
++            track.cues.prepend(std::move(main));
++        }
++        track.analysisState = RuntimeAnalysisState::Missing;
++        QJsonObject raw;
++        raw.insert(QStringLiteral("mixman"), true);
++        raw.insert(QStringLiteral("year"), source.year);
++        raw.insert(QStringLiteral("beats"), QString::fromLatin1(source.beats.toBase64()));
++        raw.insert(QStringLiteral("beats_version"), source.beatsVersion);
++        raw.insert(QStringLiteral("beats_sub_version"), source.beatsSubVersion);
++        raw.insert(QStringLiteral("bpm_locked"), source.bpmLocked);
++        for (const auto& analysis : source.analyses) {
++            const QString prefix = analysis.type == 2 ? QStringLiteral("summary_") : QStringLiteral("waveform_");
++            raw.insert(prefix + QStringLiteral("id"), double(analysis.id));
++            raw.insert(prefix + QStringLiteral("version"), analysis.version);
++            raw.insert(prefix + QStringLiteral("description"), analysis.description);
++            raw.insert(prefix + QStringLiteral("checksum"), double(analysis.checksum));
++        }
++        track.rawMetadata = raw;
++        if (!catalog->insertTrack(std::move(track))) {
++            catalog->appendDiagnostic(QStringLiteral("Track %1 omitted: catalog identity/path conflict").arg(source.id));
++        }
++    }
++
++    quint32 playlistId = 1;
++    for (const auto& list : stick.playlists) {
++        RuntimePlaylistNode node;
++        node.rekordboxId = playlistId++;
++        node.name = list.name;
++        node.sortOrder = node.rekordboxId;
++        for (const auto trackId : list.trackIds) node.trackIds.append(static_cast<quint32>(trackId));
++        if (!catalog->insertPlaylist(std::move(node))) catalog->appendDiagnostic(QStringLiteral("Playlist %1 skipped").arg(list.name));
++    }
++    if (!stick.crates.isEmpty()) {
++        RuntimePlaylistNode folder;
++        folder.rekordboxId = kMixmanCratesFolderId;
++        folder.name = QStringLiteral("CRATES");
++        folder.isFolder = true;
++        folder.sortOrder = kMixmanCratesFolderId;
++        quint32 crateId = kMixmanCrateBase;
++        for (const auto& list : stick.crates) {
++            RuntimePlaylistNode node;
++            node.rekordboxId = crateId++;
++            node.name = list.name;
++            node.sortOrder = node.rekordboxId;
++            for (const auto trackId : list.trackIds) node.trackIds.append(static_cast<quint32>(trackId));
++            folder.children.append(std::move(node));
++        }
++        if (!catalog->insertPlaylist(std::move(folder))) catalog->appendDiagnostic(QStringLiteral("Crates folder skipped"));
++    }
++    if (!catalog->seal()) {
++        if (error) *error = QStringLiteral("Cannot seal the MIXMAN catalog");
++        return false;
++    }
++    return true;
++}
++
++// Beats and the stored waveform of a stick track, applied to the temporary
++// track the browser loads (cues and metadata come from the runtime track).
++inline void applyMixmanExtras(const QString& root, const RuntimeTrack& runtime, const TrackPointer& track) {
++    if (!track || !isMixmanTrack(runtime)) return;
++    const auto& raw = runtime.rawMetadata;
++    const QByteArray beats = QByteArray::fromBase64(raw.value(QStringLiteral("beats")).toString().toLatin1());
++    const QString version = raw.value(QStringLiteral("beats_version")).toString();
++    if (!beats.isEmpty() && !version.isEmpty()) {
++        track->tryImportBeats(std::make_shared<MixmanBeatsImporter>(beats, version,
++                                      raw.value(QStringLiteral("beats_sub_version")).toString()),
++                raw.value(QStringLiteral("bpm_locked")).toBool());
++    }
++    const auto load = [&](const QString& prefix) -> ConstWaveformPointer {
++        const qint64 id = qint64(raw.value(prefix + QStringLiteral("id")).toDouble(-1));
++        if (id < 0) return {};
++        QFile file(mixman::analysisFilePath(root, id));
++        if (!file.open(QIODevice::ReadOnly) || file.size() > 64 * 1024 * 1024) return {};
++        const QByteArray compressed = file.readAll();
++        if (qint64(qChecksum(compressed)) != qint64(raw.value(prefix + QStringLiteral("checksum")).toDouble(-1))) return {};
++        const QByteArray data = qUncompress(compressed);
++        if (data.isEmpty()) return {};
++        auto* waveform = new Waveform(data);
++        waveform->setVersion(raw.value(prefix + QStringLiteral("version")).toString());
++        waveform->setDescription(raw.value(prefix + QStringLiteral("description")).toString());
++        return ConstWaveformPointer(waveform);
++    };
++    if (const auto waveform = load(QStringLiteral("waveform_"))) track->setWaveform(waveform);
++    if (const auto summary = load(QStringLiteral("summary_"))) track->setWaveformSummary(summary);
++    track->markClean();
++}
++
++} // namespace mixxx::rekordbox
+diff --git a/src/library/rekordbox/rekordboxdevice.cpp b/src/library/rekordbox/rekordboxdevice.cpp
+index 8e45c99..aa257ea 100644
+--- a/src/library/rekordbox/rekordboxdevice.cpp
++++ b/src/library/rekordbox/rekordboxdevice.cpp
+@@ -1,5 +1,6 @@
+ #include "library/rekordbox/rekordboxdevice.h"
+ #include "util/rx3usbstorage.h"
++#include "library/mixman/mixmanstick.h"
+ 
+ #include <QCryptographicHash>
+ #include <QDateTime>
+@@ -104,6 +105,15 @@ QString databasePath(const QString& root) {
+             return path;
+         }
+     }
++    // A stick written by mixman is a source of its own: its library.sqlite
++    // plays the role of export.pdb (fingerprinted, read-only).
++    const auto mixman = mixxx::mixman::databasePath(root);
++    if (!mixman.isEmpty()) {
++        const auto path = resolvePath(root, QStringLiteral("MIXMAN/library.sqlite"));
++        if (!path.isEmpty()) {
++            return path;
++        }
++    }
+     return {};
+ }
+ 
+diff --git a/src/library/rekordbox/rekordboxusbsession.cpp b/src/library/rekordbox/rekordboxusbsession.cpp
+index 7e997e7..784cf70 100644
+--- a/src/library/rekordbox/rekordboxusbsession.cpp
++++ b/src/library/rekordbox/rekordboxusbsession.cpp
+@@ -16,6 +16,7 @@
+ #include "library/rekordbox/rekordboxperformancewriter.h"
+ #include "library/rekordbox/rekordboxplaylistwriter.h"
+ #include "library/rekordbox/rekordboxtrackadapter.h"
++#include "library/rekordbox/mixmancatalog.h"
+ 
+ namespace mixxx::rekordbox {
+ namespace {
+@@ -281,6 +282,7 @@ RekordboxUsbSession::~RekordboxUsbSession() {
+ }
+ 
+ QString RekordboxUsbSession::writeList(const QString& name, const QList<quint32>& ids, bool history) {
++    if (m_mixman) return QStringLiteral("MIXMAN sticks are read-only.");
+     const std::lock_guard<std::mutex> lock(m_mutex);
+     if (m_state != UsbSessionState::Ready || !m_catalog || !m_sessionState->isActive()) return "USB session is unavailable.";
+     quint32 id = 0; const auto error = writeUsbList(&m_snapshot, name, ids, history, &id);
+@@ -292,6 +294,7 @@ QString RekordboxUsbSession::writeList(const QString& name, const QList<quint32>
+ }
+ 
+ QString RekordboxUsbSession::writePerformance(const PerformanceEdit& edit) {
++    if (m_mixman) return QStringLiteral("MIXMAN sticks are read-only.");
+     const std::lock_guard<std::mutex> lock(m_mutex);
+     if (m_state != UsbSessionState::Ready || !m_catalog || !m_sessionState->isActive()) return "USB session is unavailable.";
+     auto track = m_catalog->findTrack(edit.trackId);
+@@ -305,6 +308,7 @@ QString RekordboxUsbSession::writePerformance(const PerformanceEdit& edit) {
+ }
+ 
+ QString RekordboxUsbSession::writeRating(quint32 trackId,int rating) {
++    if (m_mixman) return QStringLiteral("MIXMAN sticks are read-only.");
+     const std::lock_guard<std::mutex> lock(m_mutex);
+     if(m_state!=UsbSessionState::Ready || !m_catalog || !m_sessionState->isActive())
+         return QStringLiteral("USB session is unavailable.");
+@@ -349,7 +353,8 @@ bool RekordboxUsbSession::load() {
+     for (const auto& name : {QStringLiteral("PIONEER"), QStringLiteral(".PIONEER")}) {
+         recognized |= QFileInfo::exists(QDir(root).filePath(name));
+     }
+-    if (!recognized) {
++    const bool mixman = !recognized && !mixxx::mixman::databasePath(root).isEmpty();
++    if (!recognized && !mixman) {
+         return fail(UsbSessionState::Error, UsbSessionError::NotRekordbox, QStringLiteral("No Rekordbox structure"));
+     }
+     protectRoot(root);
+@@ -357,7 +362,8 @@ bool RekordboxUsbSession::load() {
+     // Do not probe through out-of-volume symlinks (databasePath rejects them).
+     const auto canonicalRoot = volume.canonicalFilePath();
+     for (const auto& relative : {QStringLiteral("PIONEER"), QStringLiteral(".PIONEER"),
+-                 QStringLiteral("PIONEER/rekordbox"), QStringLiteral(".PIONEER/rekordbox")}) {
++                 QStringLiteral("PIONEER/rekordbox"), QStringLiteral(".PIONEER/rekordbox"),
++                 QStringLiteral("MIXMAN")}) {
+         const QFileInfo directory(QDir(root).filePath(relative));
+         const auto canonical = directory.canonicalFilePath();
+         if (directory.isDir() && canonical.startsWith(canonicalRoot + '/') &&
+@@ -379,14 +385,31 @@ bool RekordboxUsbSession::load() {
+                 snapshot.state == DeviceState::TooLarge ? UsbSessionError::CorruptExport : UsbSessionError::UnreadableDevice,
+                 snapshot.error);
+     }
+-    const auto document = readDatabaseFile(path, DatabaseKind::Main);
+-    if (!document.valid()) {
+-        return fail(UsbSessionState::Error, UsbSessionError::CorruptExport, document.error);
+-    }
++    QByteArray databaseBytes;
+     auto catalog = std::make_shared<RuntimeCatalog>();
+     QString error;
+-    if (!populate(root, m_sessionId, document, catalog.get(), &error)) {
+-        return fail(UsbSessionState::Error, UsbSessionError::CorruptExport, error);
++    if (mixman) {
++        QFile database(path);
++        if (!database.open(QIODevice::ReadOnly)) {
++            return fail(UsbSessionState::Unreadable, UsbSessionError::UnreadableDevice, database.errorString());
++        }
++        databaseBytes = database.readAll();
++        mixxx::mixman::Stick stick;
++        if (!mixxx::mixman::read(root, &stick, &error)) {
++            return fail(UsbSessionState::Error, UsbSessionError::CorruptExport, error);
++        }
++        if (!populateMixman(root, stick, catalog.get(), &error)) {
++            return fail(UsbSessionState::Error, UsbSessionError::CorruptExport, error);
++        }
++    } else {
++        const auto document = readDatabaseFile(path, DatabaseKind::Main);
++        if (!document.valid()) {
++            return fail(UsbSessionState::Error, UsbSessionError::CorruptExport, document.error);
++        }
++        databaseBytes = document.bytes;
++        if (!populate(root, m_sessionId, document, catalog.get(), &error)) {
++            return fail(UsbSessionState::Error, UsbSessionError::CorruptExport, error);
++        }
+     }
+     const auto extended = resolvePath(root, QDir(root).relativeFilePath(
+             QDir(QFileInfo(path).absolutePath()).filePath(QStringLiteral("exportExt.pdb"))));
+@@ -397,7 +420,7 @@ bool RekordboxUsbSession::load() {
+         return false;
+     }
+     if (!snapshot.matches(current) || snapshot.databasePath != current.databasePath ||
+-            snapshot.fingerprint != QCryptographicHash::hash(document.bytes, QCryptographicHash::Sha256)) {
++            snapshot.fingerprint != QCryptographicHash::hash(databaseBytes, QCryptographicHash::Sha256)) {
+         m_errorCode = UsbSessionError::ChangedDevice;
+         m_error = QStringLiteral("Volume/export changed during parsing");
+         invalidateLocked();
+@@ -405,6 +428,7 @@ bool RekordboxUsbSession::load() {
+         return false;
+     }
+     m_snapshot = snapshot;
++    m_mixman = mixman;
+     m_catalog = std::move(catalog);
+     m_extendedDatabasePath = extended;
+     m_state = UsbSessionState::Ready;
+@@ -666,8 +690,12 @@ TrackPointer RekordboxUsbSession::createTemporaryTrack(
+                        << rekordboxId << waveformError;
+         }
+     }
+-    return RekordboxTrackAdapter::createTemporaryTrack(
++    auto projected = RekordboxTrackAdapter::createTemporaryTrack(
+             *runtimeTrack, sessionState, std::move(loadedWaveforms), error);
++    if (projected && isMixmanTrack(*runtimeTrack)) {
++        applyMixmanExtras(m_root, *runtimeTrack, projected);
++    }
++    return projected;
+ }
+ QString RekordboxUsbSession::extendedDatabasePath() const {
+     const std::lock_guard<std::mutex> lock(m_mutex);
+diff --git a/src/library/rekordbox/rekordboxusbsession.h b/src/library/rekordbox/rekordboxusbsession.h
+index 2dfae07..5e4bb6f 100644
+--- a/src/library/rekordbox/rekordboxusbsession.h
++++ b/src/library/rekordbox/rekordboxusbsession.h
+@@ -70,6 +70,7 @@ class RekordboxUsbSession final {
+     UsbSessionError m_errorCode{UsbSessionError::None};
+     QString m_error;
+     bool m_attempted{false};
++    bool m_mixman{false};
+ };
+ 
+ } // namespace mixxx::rekordbox
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index c6a8e75..1b3f0bc 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -1149,6 +1149,10 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     void openSourceSettings() {
+         if(m_pages->currentIndex()!=1 || !m_sourceSettings->isEnabled()) return;
+         m_settingsRoot=deviceRoot(sourceDeviceForNavigation());
++        if(isMixmanRoot(m_settingsRoot)) {
++            const QString root=m_settingsRoot;m_settingsRoot.clear();
++            showUtility();openUtilityTools("IMPORT MIXMAN",[this,root]{showMixmanImport(root);});return;
++        }
+         if(!settingsSourceAvailable()) return;
+         m_sourceActionIndex=-1;updateSourceActionHighlight();m_sourceDetails->setCurrentWidget(m_sourceMenu);
+         m_sourceMenu->showMenu("MY SETTINGS",{
+@@ -1305,6 +1309,8 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         QString songs,playlists,total,available,date;
+         const bool hasDevice=row>=0 && row<int(m_devices.size());
+         const bool ready=hasDevice && deviceReady(m_devices[row]);
++        const bool mixman=ready && isMixmanRoot(deviceRoot(m_devices[row]));
++        m_sourceSettings->setText(mixman?"IMPORT TO STORAGE":"MY SETTINGS MENU");
+         m_sourceSettings->setEnabled(ready);
+         for(int i=1;i<=4;++i) m_headerButtons[i]->setEnabled(ready || isStorageRow(row) ||
+                 (m_pages->currentIndex()!=1 && (m_storageMode || deviceReady(m_selectedDevice))));
+@@ -1343,7 +1349,8 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_info->setText("<table width='100%' cellspacing='0'><tr><td colspan='2' style='background:#303030;padding:12px'>INFO</td></tr>"+
+                 line("Songs",songs)+line("Playlists",playlists)+line("Date",date)+
+                 line("Total",total+" GB")+line("Available",available+" GB")+
+-                line("Background Color",hasDevice ? rx3::sourceColorNames().value(rx3::readSourceColor(deviceRoot(m_devices[row]))) : "")+"</table>");
++                (hasDevice && isMixmanRoot(deviceRoot(m_devices[row])) ? line("Type","MIXMAN") :
++                line("Background Color",hasDevice ? rx3::sourceColorNames().value(rx3::readSourceColor(deviceRoot(m_devices[row]))) : ""))+"</table>");
+     }
+     QModelIndex featureIndex(const QString& iconName) const {
+         for(int i=0;model() && i<model()->rowCount();++i) {
+@@ -1753,6 +1760,9 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     void advanceContinuous(int deck);
+     void showAudioTools();
+     void showSoundCardTools();
++    bool isMixmanRoot(const QString& root) const;
++    QStringList mixmanRoots() const;
++    void showMixmanImport(const QString& root,std::function<void()> back={});
+     void showBeatFxTools();
+     void showRecordingTools();
+     void refreshSessionWork();
+@@ -1871,4 +1881,5 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+ #include "widget/wrx3browsertools.h"
+ #include "widget/wrx3browserutility.h"
+ #include "widget/wrx3browseraudioio.h"
++#include "widget/wrx3browsermixman.h"
+ #include "widget/wrx3browsertrack.h"
+diff --git a/src/widget/wrx3browsermixman.h b/src/widget/wrx3browsermixman.h
+new file mode 100644
+index 0000000..ae58650
+--- /dev/null
++++ b/src/widget/wrx3browsermixman.h
+@@ -0,0 +1,194 @@
++#pragma once
++
++#include <QDir>
++#include <QElapsedTimer>
++#include <QPointer>
++#include <QSet>
++#include <QStandardPaths>
++#include <QTimer>
++
++#include "analyzer/analyzerscheduledtrack.h"
++#include "library/mixman/mixmanstick.h"
++#include "library/rekordbox/rekordboxdevice.h"
++#include "track/beats.h"
++#include "track/track.h"
++#include "util/color/rgbcolor.h"
++
++// A stick written by mixman has MIXMAN/library.sqlite and no PIONEER folder.
++inline bool WRx3Browser::isMixmanRoot(const QString& root) const {
++    return !root.isEmpty() && !QFileInfo(QDir(root).filePath("PIONEER")).exists() &&
++            !QFileInfo(QDir(root).filePath(".PIONEER")).exists() &&
++            !mixxx::mixman::databasePath(root).isEmpty();
++}
++
++// Roots of the connected sources that are mixman sticks.
++inline QStringList WRx3Browser::mixmanRoots() const {
++    QStringList roots;
++    for(const auto& device:m_devices) {
++        const QString root=deviceRoot(device);
++        if(isMixmanRoot(root) && !roots.contains(root)) roots.append(root);
++    }
++    return roots;
++}
++
++// UTILITY / SOURCE > IMPORT TO STORAGE: copies a mixman stick into the local
++// library (audio, tags, beat grid, cues, colours, crates and playlists), one
++// track per event-loop turn so the interface and the audio engine stay live.
++// Tracks that already exist (same file) are never changed; crates and playlists
++// are merged by name.
++inline void WRx3Browser::showMixmanImport(const QString& root,std::function<void()> back) {
++    struct Job {
++        mixxx::mixman::Stick stick;
++        QString root,destination;
++        int index=0;
++        int added=0,existing=0,missing=0,failed=0;
++        qint64 bytes=0;
++        QHash<qint64,TrackId> ids;
++        QList<TrackId> created;
++        bool running=false,finished=false;
++        QString summary;
++    };
++    auto job=std::make_shared<Job>();
++    job->root=root;
++    QString error;
++    mixxx::mixman::Stick stick;
++    if(!mixxx::mixman::read(root,&stick,&error)) {
++        m_tools->showMenu("IMPORT MIXMAN",{},back?back:std::function<void()>([this]{showUtility();}));
++        m_tools->message("Cannot read this MIXMAN stick: "+error);return;
++    }
++    job->stick=std::move(stick);
++    const QString saved=m_config?m_config->getValueString(ConfigKey("[RX3Import]","destination")):QString();
++    job->destination=saved.isEmpty()?QDir(QStandardPaths::writableLocation(QStandardPaths::MusicLocation)).filePath("MIXMAN"):saved;
++    QPointer<WRx3Browser> guard(this);
++    const auto describe=[job]() -> QString {
++        return QString("%1 tracks, %2 crates, %3 playlists").arg(job->stick.tracks.size()).arg(job->stick.crates.size()).arg(job->stick.playlists.size());
++    };
++    // One step: copy one track's audio, add it to the library, apply its stick data.
++    const auto step=[guard,job]() {
++        if(!guard) return;
++        auto* self=guard.data();
++        auto* manager=self->m_backend?self->m_backend->trackCollectionManager():nullptr;
++        if(!manager) {job->failed=job->stick.tracks.size();job->finished=true;return;}
++        const auto& source=job->stick.tracks[job->index];
++        const QString from=mixxx::rekordbox::resolvePath(job->root,source.relativePath);
++        QString relative=source.relativePath;
++        for(const QString& prefix:{QStringLiteral("MIXMAN/Contents/"),QStringLiteral("Contents/")})
++            if(relative.startsWith(prefix)) {relative=relative.mid(prefix.size());break;}
++        const QString to=QDir(job->destination).filePath(relative);
++        if(from.isEmpty() || !QFileInfo(from).isFile()) {++job->missing;return;}
++        const qint64 size=QFileInfo(from).size();
++        if(!(QFileInfo(to).isFile() && QFileInfo(to).size()==size)) {
++            QDir().mkpath(QFileInfo(to).absolutePath());
++            const QString part=to+".part";
++            QFile::remove(part);
++            if(!QFile::copy(from,part) || !QFile::rename(part,to)) {QFile::remove(part);++job->failed;return;}
++            job->bytes+=size;
++        }
++        bool already=false;
++        TrackPointer track=manager->getOrAddTrack(TrackRef::fromFilePath(to),&already);
++        if(!track || !track->getId().isValid()) {++job->failed;return;}
++        job->ids.insert(source.id,track->getId());
++        if(already) {++job->existing;return;}
++        ++job->added;
++        job->created.append(track->getId());
++        track->setTitle(source.title);
++        track->setArtist(source.artist);
++        track->setAlbum(source.album);
++        track->setAlbumArtist(source.albumArtist);
++        track->updateGenre(source.genre);
++        track->setYear(source.year);
++        track->setComment(source.comment);
++        track->setComposer(source.composer);
++        track->setGrouping(source.grouping);
++        if(source.rating>=0 && source.rating<=5) track->setRating(source.rating);
++        if(source.color) track->setColor(mixxx::RgbColor::optional(mixxx::RgbColor::validateCode(*source.color)));
++        if(!source.key.isEmpty()) track->setKeyText(source.key,mixxx::track::io::key::FILE_METADATA);
++        const auto rate=track->getSampleRate().isValid()?track->getSampleRate():mixxx::audio::SampleRate(source.samplerate);
++        if(!source.beats.isEmpty() && !source.beatsVersion.isEmpty() && rate.isValid()) {
++            if(const auto beats=mixxx::Beats::fromByteArray(rate,source.beatsVersion,source.beatsSubVersion,source.beats)) {
++                track->trySetBeats(beats);
++                if(source.bpmLocked) track->setBpmLocked(true);
++            }
++        }
++        for(const auto& cue:source.cues) {
++            if(cue.type==1 && cue.hotcue>=0)
++                track->createAndAddCue(mixxx::CueType::HotCue,cue.hotcue,cue.position,-1.0,
++                        mixxx::RgbColor(mixxx::RgbColor::validateCode(cue.color.value_or(0xFF0000))))->setLabel(cue.label);
++            else if(cue.type==4 && cue.length>0)
++                track->createAndAddCue(cue.hotcue>=0?mixxx::CueType::Loop:mixxx::CueType::Loop,cue.hotcue,cue.position,cue.position+cue.length,
++                        mixxx::RgbColor(mixxx::RgbColor::validateCode(cue.color.value_or(0xFF0000))))->setLabel(cue.label);
++        }
++        if(source.mainCue>=0) track->setMainCuePosition(mixxx::audio::FramePos::fromEngineSamplePosMaybeInvalid(source.mainCue));
++    };
++    // Crates and playlists, merged by name once every track is in the library.
++    const auto finish=[guard,job]() {
++        if(!guard) return;
++        auto* self=guard.data();
++        auto* collection=self->storageCollection();
++        int crates=0,playlists=0;
++        if(collection) {
++            for(const auto& list:job->stick.crates) {
++                QList<TrackId> members;
++                for(const auto id:list.trackIds) if(job->ids.contains(id)) members.append(job->ids.value(id));
++                Crate crate;CrateId crateId;
++                if(collection->crates().readCrateByName(list.name,&crate)) crateId=crate.getId();
++                else {Crate created;created.setName(list.name);if(!collection->insertCrate(created,&crateId)) continue;}
++                if(crateId.isValid() && !members.isEmpty()) collection->addCrateTracks(crateId,members);
++                ++crates;
++            }
++            auto& dao=collection->getPlaylistDAO();
++            for(const auto& list:job->stick.playlists) {
++                int playlistId=dao.getPlaylistIdFromName(list.name);
++                if(playlistId<0) playlistId=dao.createPlaylist(list.name);
++                if(playlistId<0) continue;
++                QList<TrackId> members;
++                for(const auto id:list.trackIds) {
++                    const auto local=job->ids.value(id);
++                    if(local.isValid() && !dao.isTrackInPlaylist(local,playlistId) && !members.contains(local)) members.append(local);
++                }
++                if(!members.isEmpty()) dao.appendTracksToPlaylist(members,playlistId);
++                ++playlists;
++            }
++        }
++        // New tracks get their own waveform from the normal analysis queue;
++        // the imported beat grids are kept.
++        if(!job->created.isEmpty() && self->m_backend) {
++            QList<AnalyzerScheduledTrack> tracks;
++            for(const auto id:job->created) tracks.append(AnalyzerScheduledTrack(id));
++            emit self->m_backend->analyzeTracks(tracks);
++        }
++        job->summary=QString("Done: %1 added, %2 already in STORAGE, %3 crates, %4 playlists.").arg(job->added).arg(job->existing).arg(crates).arg(playlists);
++        if(job->missing) job->summary+=QString(" %1 file(s) missing on the stick.").arg(job->missing);
++        if(job->failed) job->summary+=QString(" %1 failed.").arg(job->failed);
++        job->finished=true;job->running=false;
++    };
++    // The timer chain: one track per turn, then the lists.
++    auto run=std::make_shared<std::function<void()>>();
++    *run=[guard,job,step,finish,run]() {
++        if(!guard) return;
++        auto* self=guard.data();
++        if(job->index<job->stick.tracks.size()) {
++            step();++job->index;
++            self->m_tools->message(QString("Importing %1 / %2 …").arg(job->index).arg(job->stick.tracks.size()));
++            self->m_tools->refresh();
++            QTimer::singleShot(0,self,[run]{(*run)();});
++        } else {
++            finish();
++            self->m_tools->message(job->summary);self->m_tools->refresh();
++        }
++    };
++    std::vector<ToolAction> actions;
++    actions.push_back({[job,describe]() -> QString {return QString("STICK:  ")+describe();},{},{}});
++    actions.push_back({[job]() -> QString {return QString("COPY AUDIO TO:  ")+job->destination;},{},{}});
++    actions.push_back({[job]() -> QString {
++            return job->running?QString("IMPORTING …"):job->finished?QString("IMPORT AGAIN ›"):QString("START IMPORT ›");},
++        [job,run,this]{
++            if(job->running) return;
++            if(job->stick.tracks.isEmpty()) {m_tools->message("This stick has no tracks.");return;}
++            job->index=0;job->added=job->existing=job->missing=job->failed=0;job->bytes=0;
++            job->ids.clear();job->created.clear();job->running=true;job->finished=false;
++            QTimer::singleShot(0,this,[run]{(*run)();});
++        },{}});
++    m_tools->showMenu("IMPORT MIXMAN STICK TO STORAGE",std::move(actions),back?back:std::function<void()>([this]{showUtility();}));
++    m_tools->message("Audio is copied to the folder above; tags, beat grids, cues, crates and playlists are brought into STORAGE. Existing tracks are left untouched.");
++}
+diff --git a/src/widget/wrx3browserutility.h b/src/widget/wrx3browserutility.h
+index 41a7824..eaabbb2 100644
+--- a/src/widget/wrx3browserutility.h
++++ b/src/widget/wrx3browserutility.h
+@@ -112,6 +112,10 @@ inline void WRx3Browser::showUtility() {
+         };
+         settings.push_back(std::move(analyze));
+     }
++    action("BROWSER","IMPORT MIXMAN STICK TO STORAGE",[this]{
++        const auto roots=mixmanRoots();
++        if(roots.isEmpty()) {m_tools->message("Plug in a stick exported by mixman (it has a MIXMAN folder).");return;}
++        showMixmanImport(roots.first());});
+     action("BROWSER","TRACK TOOLS (CRATE / PLAYLIST / BPM / COLOR)",[this]{showTrackToolsMenu();});
+     action("RECORDING","USB RECORDING",[this]{showRecordingTools();});
+     action("GENERAL","POWER (EXIT / SLEEP / SHUTDOWN)",[this]{showPowerMenu();});

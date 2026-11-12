@@ -1,0 +1,75 @@
+<Template>
+  <WidgetGroup>
+    <ObjectName>RX3Topbar</ObjectName><Connection><ConfigKey>[Tab],library</ConfigKey><BindProperty>visible</BindProperty><Transform><Not /></Transform></Connection>
+    <Layout>horizontal</Layout>
+    <Size>0me,20f</Size>
+    <Children>
+      <WidgetGroup><ObjectName>RX3TransportRail</ObjectName><Layout>horizontal</Layout><Size>280f,16f</Size><Children>
+      <WidgetGroup>
+        <ObjectName>RX3RemainBlock</ObjectName>
+        <Layout>horizontal</Layout>
+        <Size>75f,0me</Size>
+        <Children>
+          <Label><ObjectName>RX3ClockIcon</ObjectName><Text>◴</Text></Label>
+          <Label><ObjectName>RX3RemainLabel</ObjectName><Text>REMAIN</Text></Label>
+          <NumberPos>
+            <ObjectName>RX3MasterTime</ObjectName><Rx3Format>transport</Rx3Format>
+            <Channel>1</Channel>
+            <NumberOfDigits>6</NumberOfDigits>
+            <Connection><ConfigKey>[Channel1],playposition</ConfigKey></Connection>
+          </NumberPos>
+        </Children>
+        <Connection><ConfigKey>[Tab],library</ConfigKey><BindProperty>visible</BindProperty><Transform><Not /></Transform></Connection>
+      </WidgetGroup>
+
+      
+      <WidgetGroup>
+        <ObjectName>RX3ProgressTrack</ObjectName>
+        <Layout>horizontal</Layout>
+        <Size>0me,2f</Size>
+        <Children>
+          <VuMeter>
+            <ObjectName>RX3ProgressMeter</ObjectName>
+            <PathVu>skin:/images/progress_fill.svg</PathVu>
+            <PathBack>skin:/images/progress_back.svg</PathBack>
+            <Horizontal>true</Horizontal>
+            <PeakHoldSize>0</PeakHoldSize>
+            <PeakHoldTime>0</PeakHoldTime>
+            <PeakFallTime>0</PeakFallTime>
+            <PeakFallStep>1</PeakFallStep>
+            <Connection><ConfigKey>[Channel1],playposition</ConfigKey></Connection>
+          </VuMeter>
+        </Children>
+      </WidgetGroup>
+
+      </Children></WidgetGroup>
+      <WidgetGroup>
+        <ObjectName>RX3BrowseRemainBlock</ObjectName>
+        <Layout>horizontal</Layout>
+        <Size>56f,0me</Size>
+        <Children>
+          <Label><ObjectName>RX3BrowseClockIcon</ObjectName><Text>◴</Text></Label>
+          <NumberPos>
+            <ObjectName>RX3BrowseMasterTime</ObjectName><Rx3Format>transport</Rx3Format>
+            <Channel>1</Channel>
+            <NumberOfDigits>6</NumberOfDigits>
+            <Connection><ConfigKey>[Channel1],playposition</ConfigKey></Connection>
+          </NumberPos>
+        </Children>
+        <Connection><ConfigKey>[Tab],library</ConfigKey><BindProperty>visible</BindProperty></Connection>
+      </WidgetGroup>
+
+      <WidgetGroup><ObjectName>RX3TopbarGap</ObjectName><Size>0me,0me</Size></WidgetGroup>
+      <WidgetGroup>
+        <ObjectName>RX3TopbarStatus</ObjectName>
+        <Layout>horizontal</Layout>
+        <Size>97f,0me</Size>
+        <Children>
+          <Label><ObjectName>RX3RecordDot</ObjectName><Text>●</Text></Label>
+          <Time><ObjectName>RX3Clock</ObjectName><TooltipId>time</TooltipId><Align>center</Align></Time>
+          <Label><ObjectName>RX3InfoLabel</ObjectName><Text>◀ INFO</Text></Label>
+        </Children>
+      </WidgetGroup>
+    </Children>
+  </WidgetGroup>
+</Template>

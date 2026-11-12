@@ -1,0 +1,200 @@
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index bacbc57..81bbb73 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -317,6 +317,8 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         connect(m_library, &QStackedWidget::currentChanged, this, [this](int){ refreshTable(); });
+         for (QWidget* w : {static_cast<QWidget*>(m_categories), static_cast<QWidget*>(m_sidebar), static_cast<QWidget*>(m_sources)}) w->installEventFilter(this);
+         makeControl("enabled", [](double){}, true)->set(1);
++        // Read-only mirror of the browser page being on screen (keyboard layer).
++        m_shownControl=makeControl("shown", [](double){}, true);
+         makeControl("move", [this](double value){ if(value != 0) {move(qRound(value));updateNavigationHighlight();} });
+         makeControl("enter", [this](double value){ if(value > 0) {
+             if (!isVisible()) openBrowser();
+@@ -330,6 +332,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         makeControl("open", [this](double value){ if(value > 0) openBrowser(); });
+         makeControl("tools",[this](double value){if(value>0) showTools();});
+         makeControl("track_tools",[this](double value){if(value>0) showTrackTools();});
++        makeControl("track_tools_deck",[this](double value){if(value>0) showTrackTools(true);});
+         makeControl("close_tools",[this](double value){if(value>0 && m_utilitySessionActive) closeUtility();});
+         makeControl("power",[this](double value){if(value>0) showPowerTools();});
+         makeControl("utility",[this](double value){if(value>0) {if(m_pages->currentWidget()==m_utility) closeUtility();else showUtility();}});
+@@ -434,7 +437,12 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         }
+     }
+   protected:
++    void showEvent(QShowEvent* event) override {
++        if(m_shownControl) m_shownControl->set(1);
++        QWidget::showEvent(event);
++    }
+     void hideEvent(QHideEvent* event) override {
++        if(m_shownControl) m_shownControl->set(0);
+         if(m_toolPreview) m_toolPreview->cancel();
+         m_resumeFocus=m_focus;
+         QWidget::hideEvent(event);
+@@ -1474,6 +1482,11 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         if(!key.isEmpty()) terms<<QString("~key:%1").arg(key);
+         const double bpm=track->getBpm();
+         if(bpm>0) terms<<QString("bpm:%1-%2").arg(bpm*0.94,0,'f',1).arg(bpm*1.06,0,'f',1);
++        if(terms.isEmpty()) return {};
++        // The reference track itself is not a match (as on USB).
++        QString self=track->getTitle().isEmpty()?track->getFileInfo().fileName():track->getTitle();
++        self.remove('"');
++        if(!self.isEmpty()) terms<<QString("-\"%1\"").arg(self);
+         return terms.join(' ');
+     }
+     void showStorageFacet(const QString& label,const QString& column) {
+@@ -1742,7 +1755,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     // of the selected or loaded track, and EXIT / SLEEP / SHUTDOWN.
+     TrackPointer toolTarget() const;
+     QString toolTargetLabel() const;
+-    void showTrackTools();
++    void showTrackTools(bool useDeck=false);
+     void showTrackToolsMenu();
+     void showTrackCrateMenu();
+     void showTrackPlaylistMenu();
+@@ -1771,6 +1784,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     QString m_utilityReturnBreadcrumb;
+     UserSettingsPointer m_config;
+     TrackPointer m_toolTrack;
++    ControlObject* m_shownControl=nullptr;
+     quint32 m_toolPlaylist=0;
+     rx3::TrackFilter m_filter;
+     QHash<QString,rx3::TagList> m_tagLists;
+diff --git a/src/widget/wrx3browsertrack.h b/src/widget/wrx3browsertrack.h
+index 29feb4e..29d0987 100644
+--- a/src/widget/wrx3browsertrack.h
++++ b/src/widget/wrx3browsertrack.h
+@@ -51,8 +51,11 @@ inline bool WRx3Browser::confirmed(const QString& id) {
+     m_confirmId=id;m_confirmClock.restart();return false;
+ }
+ 
+-inline void WRx3Browser::showTrackTools() {
++// useDeck: opened from PERFORMANCE ([RX3Browser],track_tools_deck), so the browser's leftover selection
++// is not the target; the active deck is.
++inline void WRx3Browser::showTrackTools(bool useDeck) {
+     showUtility();
++    if(useDeck) {m_toolTrack.reset();m_trackToolDeck=0;}
+     openUtilityTools("TRACK TOOLS",[this]{showTrackToolsMenu();});
+ }
+ 
+diff --git a/src/widget/wrx3keyboard.h b/src/widget/wrx3keyboard.h
+index ef33249..63adeb5 100644
+--- a/src/widget/wrx3keyboard.h
++++ b/src/widget/wrx3keyboard.h
+@@ -18,14 +18,15 @@
+ // Preferences and other dialogs keep their own Return/Escape behaviour, and
+ // text fields keep Backspace/Left/Right.
+ //
+-//   Up / Down            BROWSE turn           Shift+Up/Down (or Shift+Left/Right)
+-//   Return / Enter       BROWSE press                          step the header
+-//   Backspace            BACK                  F1  SOURCE
+-//   Shift+Return         BACK                  F2  BROWSE <-> PERFORMANCE
+-//   Escape               close SHORTCUT / BACK F3  SHORTCUT
+-//   F4  TRACK TOOLS      F5  UTILITY (MENU)    F6  GRID on/off
+-//   F7  TAG LIST         F8  PLAYLIST          F9  SEARCH
+-//   F10 POWER            Ctrl+1..4 LOAD to deck 1..4
++//   Up / Down            BROWSE turn           Shift+Up/Down  step the header
++//   Return / Enter       BROWSE press          Backspace, Shift+Return  BACK
++//   Escape               close SHORTCUT / GRID, else BACK
++//   Ctrl+F1 SOURCE   Ctrl+F2 BROWSE/PERFORMANCE   Ctrl+F3 SHORTCUT
++//   Ctrl+F4 TRACK TOOLS   Ctrl+F5 MENU   Ctrl+F6 GRID   Ctrl+F7 TAG LIST
++//   Ctrl+F8 PLAYLIST   Ctrl+F9 SEARCH   Ctrl+F10 POWER
++//   Alt+1..4             LOAD the selected track to deck 1..4
++// Plain F-keys and Shift+Left/Right stay with Mixxx's default pitch/load keys,
++// Ctrl+1..4 with its View menu.
+ class WRx3Keyboard : public QObject {
+   public:
+     explicit WRx3Keyboard(QWidget* canvas) : QObject(canvas), m_canvas(canvas) {
+@@ -45,7 +46,7 @@ class WRx3Keyboard : public QObject {
+                 qobject_cast<QTextEdit*>(QApplication::focusWidget()) ||
+                 qobject_cast<QPlainTextEdit*>(QApplication::focusWidget());
+         const auto mods=key->modifiers()&~Qt::KeypadModifier;
+-        const bool shift=mods==Qt::ShiftModifier,plain=mods==Qt::NoModifier,ctrl=mods==Qt::ControlModifier;
++        const bool shift=mods==Qt::ShiftModifier,plain=mods==Qt::NoModifier,ctrl=mods==Qt::ControlModifier,alt=mods==Qt::AltModifier;
+         const int code=key->key();
+         if(key->isAutoRepeat() && !(code==Qt::Key_Up || code==Qt::Key_Down)) return false;
+         if(plain) {
+@@ -55,6 +56,19 @@ class WRx3Keyboard : public QObject {
+             case Qt::Key_Return: case Qt::Key_Enter: press();return true;
+             case Qt::Key_Backspace: if(typing) return false;back();return true;
+             case Qt::Key_Escape: escape();return true;
++            default: return false;
++            }
++        }
++        if(shift) {
++            switch(code) {
++            case Qt::Key_Up: step(-1);return true;
++            case Qt::Key_Down: step(1);return true;
++            case Qt::Key_Return: case Qt::Key_Enter: back();return true;
++            default: return false;
++            }
++        }
++        if(ctrl) {
++            switch(code) {
+             case Qt::Key_F1: source();return true;
+             case Qt::Key_F2: view();return true;
+             case Qt::Key_F3: pulse("[RX3Shortcut]","toggle");return true;
+@@ -65,18 +79,10 @@ class WRx3Keyboard : public QObject {
+             case Qt::Key_F8: header("playlist");return true;
+             case Qt::Key_F9: header("search");return true;
+             case Qt::Key_F10: power();return true;
+-            default: return false;
+-            }
+-        }
+-        if(shift) {
+-            switch(code) {
+-            case Qt::Key_Up: case Qt::Key_Left: step(-1);return true;
+-            case Qt::Key_Down: case Qt::Key_Right: step(1);return true;
+-            case Qt::Key_Return: case Qt::Key_Enter: back();return true;
+-            default: return false;
++            default: break;
+             }
+         }
+-        if(ctrl && code>=Qt::Key_1 && code<=Qt::Key_4) {
++        if(alt && code>=Qt::Key_1 && code<=Qt::Key_4) {
+             const auto group=QString("[Channel%1]").arg(code-Qt::Key_0).toLatin1();
+             pulse(group.constData(),"LoadSelectedTrack");return true;
+         }
+@@ -150,8 +156,10 @@ class WRx3Keyboard : public QObject {
+     }
+     void header(const char* name) {
+         if(shortcutVisible() || infoVisible()) return;
++        // From PERFORMANCE nothing is selected on screen: TRACK TOOLS targets the active deck.
++        const bool onScreen=get("[RX3Browser]","shown")>0;
+         openBrowser();
+-        pulse("[RX3Browser]",name);
++        pulse("[RX3Browser]",(!onScreen && qstrcmp(name,"track_tools")==0)?"track_tools_deck":name);
+         for(int i=0;i<kSections;++i) if(qstrcmp(name,kSection[i])==0) m_section=i;
+     }
+     // SHIFT+turn on the controllers: SOURCE, BROWSE, TAG LIST, PLAYLIST,
+diff --git a/src/widget/wtracktableview.cpp b/src/widget/wtracktableview.cpp
+index ef70767..130494e 100644
+--- a/src/widget/wtracktableview.cpp
++++ b/src/widget/wtracktableview.cpp
+@@ -97,6 +97,25 @@ class Rx3TrackDelegate : public QStyledItemDelegate {
+         p->save();
+         const bool selected = option.state & QStyle::State_Selected;
+         p->fillRect(option.rect, selected ? QColor("#007CE0") : QColor(index.row() % 2 ? "#262626" : "#000000"));
++        // TRACK TOOLS > COLOR: show the track colour as a row tint, and as a bar on the selected row.
++        {
++            const QVariant colorValue = index.data(Qt::BackgroundRole);
++            QColor trackColor;
++            if (colorValue.canConvert<QBrush>() && colorValue.typeId() == QMetaType::QBrush) {
++                trackColor = colorValue.value<QBrush>().color();
++            } else if (colorValue.canConvert<QColor>()) {
++                trackColor = colorValue.value<QColor>();
++            }
++            if (trackColor.isValid()) {
++                trackColor.setAlpha(selected ? 255 : 150);
++                if (selected) {
++                    if (m_view->horizontalHeader()->visualIndex(index.column()) == 0)
++                    p->fillRect(QRect(option.rect.left(), option.rect.top(), qMax(4, option.rect.height() / 8), option.rect.height()), trackColor);
++                } else {
++                    p->fillRect(option.rect, trackColor);
++                }
++            }
++        }
+         const QString field = m_view->columnNameOfIndex(index);
+         const auto* trackModel = dynamic_cast<TrackModel*>(m_view->model());
+         const QUrl identity = trackModel ? trackModel->getTrackUrl(index) : QUrl();

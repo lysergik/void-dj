@@ -1,0 +1,80 @@
+diff --git a/src/widget/rx3loadtarget.h b/src/widget/rx3loadtarget.h
+new file mode 100644
+index 0000000..ea36268
+--- /dev/null
++++ b/src/widget/rx3loadtarget.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <functional>
++
++// Deck chosen in the RX3 browser (MATCHING: DECK 1 / DECK 2) that a plain
++// double-click / touch load should target; 0 means "no preference" and Mixxx's
++// usual first-free-deck rule applies. Evaluated lazily so it is always current.
++inline std::function<int()>& rx3LoadTargetDeck() {
++    static std::function<int()> provider;
++    return provider;
++}
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index 010ea9a..c6a8e75 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -48,6 +48,7 @@
+ #include "widget/rx3browsernavigation.h"
+ #include "widget/rx3libraryworkflow.h"
+ #include "widget/wrx3toolmenu.h"
++#include "widget/rx3loadtarget.h"
+ #include "widget/wrx3utility.h"
+ #include "widget/wrx3beatfx.h"
+ #include "widget/rx3touchpreview.h"
+@@ -319,6 +320,12 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         makeControl("enabled", [](double){}, true)->set(1);
+         // Read-only mirror of the browser page being on screen (keyboard layer).
+         m_shownControl=makeControl("shown", [](double){}, true);
++        // A track opened from MATCHING loads to the deck chosen there when it is double-clicked.
++        rx3LoadTargetDeck()=[this]()->int {
++            if(!isVisible() || m_pages->currentIndex()!=0 || m_level!=BrowserLevel::Tracks || m_returnLevel!=BrowserLevel::FacetValues) return 0;
++            if(m_facetField!="matching" && m_facetField!="storage:matching") return 0;
++            return m_facets->currentRow()+1;
++        };
+         makeControl("move", [this](double value){ if(value != 0) {move(qRound(value));updateNavigationHighlight();} });
+         makeControl("enter", [this](double value){ if(value > 0) {
+             if (!isVisible()) openBrowser();
+@@ -378,7 +385,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+             if(m_selectedCategory=="MATCHING") updateFacetPreview();
+         });
+     }
+-    ~WRx3Browser() override = default;
++    ~WRx3Browser() override {rx3LoadTargetDeck()=nullptr;}
+     QString infoUsbName(const QString& root) const {return QString("USB%1").arg(m_usbSlots.value(root));}
+     // Source readout for a loaded deck: the USB slot that holds the file, or
+     // STORAGE for the local Mixxx library.
+diff --git a/src/widget/wtracktableview.cpp b/src/widget/wtracktableview.cpp
+index 130494e..74eb146 100644
+--- a/src/widget/wtracktableview.cpp
++++ b/src/widget/wtracktableview.cpp
+@@ -42,6 +42,7 @@
+ #include "util/dnd.h"
+ #include "util/time.h"
+ #include "widget/wtrackmenu.h"
++#include "widget/rx3loadtarget.h"
+ #include "widget/wtracktableviewheader.h"
+ 
+ namespace {
+@@ -693,7 +694,15 @@ void WTrackTableView::slotMouseDoubleClicked(const QModelIndex& index) {
+                     TrackModel::Capability::LoadToDeck)) {
+         TrackPointer pTrack = pTrackModel->getTrack(index);
+         if (pTrack) {
+-            emit loadTrack(pTrack);
++            // RX3: MATCHING remembers the deck it was opened for.
++            const int rx3Deck = rx3LoadTargetDeck() ? rx3LoadTargetDeck()() : 0;
++            const QString rx3Group = QStringLiteral("[Channel%1]").arg(rx3Deck);
++            if (rx3Deck > 0 && ControlObject::exists(ConfigKey(rx3Group, "play")) &&
++                    ControlObject::get(ConfigKey(rx3Group, "play")) <= 0.0) {
++                emit loadTrackToPlayer(pTrack, rx3Group, false);
++            } else {
++                emit loadTrack(pTrack);
++            }
+         }
+     } else if (doubleClickAction == DlgPrefLibrary::TrackDoubleClickAction::AddToAutoDJBottom &&
+             pTrackModel->hasCapabilities(

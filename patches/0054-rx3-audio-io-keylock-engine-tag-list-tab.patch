@@ -1,0 +1,362 @@
+diff --git a/src/mixxxmainwindow.cpp b/src/mixxxmainwindow.cpp
+index 560ef9c..1f0a15f 100644
+--- a/src/mixxxmainwindow.cpp
++++ b/src/mixxxmainwindow.cpp
+@@ -63,6 +63,7 @@
+ #include "waveform/visualsmanager.h"
+ #include "waveform/waveformwidgetfactory.h"
+ #include "widget/rx3ui.h"
++#include "widget/rx3soundaccess.h"
+ #include "widget/wglwidget.h"
+ #include "widget/wmainmenubar.h"
+ 
+@@ -304,6 +305,8 @@ void MixxxMainWindow::initialize() {
+             WaveformWidgetFactory::instance(),
+             &WaveformWidgetFactory::slotSkinLoaded);
+ 
++    rx3SoundManager()=m_pCoreServices->getSoundManager();
++
+     // Initialize preference dialog
+     m_pPrefDlg = new DlgPreferences(
+             m_pCoreServices->getScreensaverManager(),
+diff --git a/src/widget/rx3soundaccess.h b/src/widget/rx3soundaccess.h
+new file mode 100644
+index 0000000..421cf72
+--- /dev/null
++++ b/src/widget/rx3soundaccess.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <memory>
++
++#include "soundio/soundmanager.h"
++
++// The skin widgets are created long after CoreServices, but the legacy skin
++// parser has no access to it. MixxxMainWindow publishes the sound manager here
++// so the STORAGE/UTILITY pages can configure audio I/O without the preferences
++// dialog.
++inline std::weak_ptr<SoundManager>& rx3SoundManager() {
++    static std::weak_ptr<SoundManager> manager;
++    return manager;
++}
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index 81bbb73..010ea9a 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -505,7 +505,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         int selected=1;
+         if(m_pages->currentWidget()==m_tools || m_pages->currentWidget()==m_utility) selected=5;
+         else if(m_pages->currentIndex()==1) selected=0;
+-        else if(m_selectedCategory=="TAG LIST") selected=2;
++        else if(m_selectedCategory=="TAG LIST" || m_selectedCategory=="CRATES") selected=2;
+         else if(m_selectedCategory=="PLAYLIST") selected=3;
+         else if(m_selectedCategory=="SEARCH") selected=4;
+         for(int i=0;i<m_headerButtons.size();++i) {
+@@ -1745,6 +1745,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     void showPlaybackTools();
+     void advanceContinuous(int deck);
+     void showAudioTools();
++    void showSoundCardTools();
+     void showBeatFxTools();
+     void showRecordingTools();
+     void refreshSessionWork();
+@@ -1862,4 +1863,5 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+ 
+ #include "widget/wrx3browsertools.h"
+ #include "widget/wrx3browserutility.h"
++#include "widget/wrx3browseraudioio.h"
+ #include "widget/wrx3browsertrack.h"
+diff --git a/src/widget/wrx3browseraudioio.h b/src/widget/wrx3browseraudioio.h
+new file mode 100644
+index 0000000..797c0c7
+--- /dev/null
++++ b/src/widget/wrx3browseraudioio.h
+@@ -0,0 +1,147 @@
++#pragma once
++
++#include <QSet>
++
++#include "widget/rx3soundaccess.h"
++#include "soundio/soundmanagerconfig.h"
++#include "soundio/sounddevice.h"
++
++// UTILITY > AUDIO I/O: choose the sound card and channel pair of every Mixxx
++// audio input and output with the encoder, then APPLY.
++inline void WRx3Browser::showSoundCardTools() {
++    const auto manager=rx3SoundManager().lock();
++    if(!manager) {
++        m_tools->showMenu("AUDIO I/O",{},[this]{showUtility();});
++        m_tools->message("The sound manager is unavailable.");return;
++    }
++    struct Path {QString label;AudioPathType type;unsigned char index;bool output;};
++    struct Choice {bool none=true;SoundDeviceId id;unsigned char base=0;int channels=0;QString label;};
++    struct State {SoundManagerConfig draft;bool dirty=false;QList<Path> paths;};
++    
++    auto state=std::make_shared<State>(State{manager->getConfig(),false,{}});
++    
++    state->paths<<Path{"MASTER OUTPUT",AudioPathType::Main,0,true}
++        <<Path{"HEADPHONES OUTPUT",AudioPathType::Headphones,0,true}
++        <<Path{"BOOTH OUTPUT",AudioPathType::Booth,0,true};
++    const int decks=std::clamp(int(state->draft.getDeckCount()),1,4);
++    for(int i=0;i<decks;++i) state->paths<<Path{QString("DECK %1 OUTPUT").arg(i+1),AudioPathType::Deck,(unsigned char)i,true};
++    for(int i=0;i<decks;++i) state->paths<<Path{QString("DECK %1 TIMECODE / VINYL INPUT").arg(i+1),AudioPathType::VinylControl,(unsigned char)i,false};
++    for(int i=0;i<4;++i) state->paths<<Path{QString("MICROPHONE %1 INPUT").arg(i+1),AudioPathType::Microphone,(unsigned char)i,false};
++    for(int i=0;i<4;++i) state->paths<<Path{QString("AUXILIARY %1 INPUT").arg(i+1),AudioPathType::Auxiliary,(unsigned char)i,false};
++
++    const auto channelText=[](unsigned char base,int channels) {
++        return channels>1?QString("%1-%2").arg(base+1).arg(base+channels):QString::number(base+1);
++    };
++    // The current assignment of a path, or none.
++    const auto current=[state,channelText](const Path& path) -> Choice {
++        Choice choice;
++        const auto find=[&](auto map) {
++            for(auto it=map.cbegin();it!=map.cend();++it) {
++                if(it.value().getType()!=path.type || it.value().getIndex()!=path.index) continue;
++                choice.none=false;choice.id=it.key();choice.base=it.value().getChannelGroup().getChannelBase();
++                choice.channels=it.value().getChannelGroup().getChannelCount();
++                choice.label=it.key().name+" "+channelText(choice.base,choice.channels);
++            }
++        };
++        if(path.output) find(state->draft.getOutputs());else find(state->draft.getInputs());
++        return choice;
++    };
++    // Every free device/channel group for a path (channels used by another path on the same card are skipped).
++    const auto options=[state,manager,current,channelText](const Path& path) {
++        QList<Choice> list;list<<Choice{};
++        const int width=path.type==AudioPathType::Microphone?1:2;
++        QList<QPair<SoundDeviceId,QPair<int,int>>> used;
++        const auto collect=[&](auto map) {
++            for(auto it=map.cbegin();it!=map.cend();++it) {
++                if(it.value().getType()==path.type && it.value().getIndex()==path.index) continue;
++                used<<qMakePair(it.key(),qMakePair(int(it.value().getChannelGroup().getChannelBase()),int(it.value().getChannelGroup().getChannelCount())));
++            }
++        };
++        if(path.output) collect(state->draft.getOutputs());else collect(state->draft.getInputs());
++        const auto devices=manager->getDeviceList(state->draft.getAPI(),path.output,!path.output);
++        for(const auto& device:devices) {
++            const int total=path.output?int(device->getNumOutputChannels()):int(device->getNumInputChannels());
++            for(int base=0;base+width<=total;base+=width) {
++                bool clash=false;
++                for(const auto& other:used) if(other.first==device->getDeviceId() &&
++                        base<other.second.first+other.second.second && other.second.first<base+width) clash=true;
++                if(clash) continue;
++                Choice choice;choice.none=false;choice.id=device->getDeviceId();choice.base=(unsigned char)base;choice.channels=width;
++                choice.label=device->getDisplayName()+" "+channelText((unsigned char)base,width);
++                list<<choice;
++            }
++        }
++        return list;
++    };
++    const auto assign=[state](const Path& path,const Choice& choice) {
++        const auto outputs=state->draft.getOutputs();const auto inputs=state->draft.getInputs();
++        if(path.output) {
++            state->draft.clearOutputs();
++            for(auto it=outputs.cbegin();it!=outputs.cend();++it)
++                if(!(it.value().getType()==path.type && it.value().getIndex()==path.index)) state->draft.addOutput(it.key(),it.value());
++            if(!choice.none) state->draft.addOutput(choice.id,AudioOutput(path.type,choice.base,mixxx::audio::ChannelCount(choice.channels),path.index));
++        } else {
++            state->draft.clearInputs();
++            for(auto it=inputs.cbegin();it!=inputs.cend();++it)
++                if(!(it.value().getType()==path.type && it.value().getIndex()==path.index)) state->draft.addInput(it.key(),it.value());
++            if(!choice.none) state->draft.addInput(choice.id,AudioInput(path.type,choice.base,mixxx::audio::ChannelCount(choice.channels),path.index));
++        }
++        state->dirty=true;
++    };
++
++    std::vector<WRx3ToolMenu::Action> actions;
++    for(const auto& path:state->paths) {
++        actions.push_back({
++            [path,current]{const auto c=current(path);return QString(path.label+":  "+(c.none?QString("— NONE —"):c.label));},
++            {},
++            [path,options,current,assign,this](int delta) {
++                const auto list=options(path);const auto now=current(path);
++                int index=0;
++                for(int i=0;i<list.size();++i) if(!list[i].none && !now.none && list[i].id==now.id && list[i].base==now.base) index=i;
++                index=((index+delta)%list.size()+list.size())%list.size();
++                assign(path,list[index]);
++                m_tools->message("Press to finish, then choose APPLY to switch the sound card.");
++            }});
++    }
++    // Sample rate of the selected API.
++    {
++        actions.push_back({
++            [state]{return QString("SAMPLE RATE:  %1 Hz").arg(int(state->draft.getSampleRate()));},
++            {},
++            [state,manager](int delta) {
++                const auto rates=manager->getSampleRates(state->draft.getAPI());
++                if(rates.isEmpty()) return;
++                int index=0;
++                for(int i=0;i<rates.size();++i) if(rates[i]==state->draft.getSampleRate()) index=i;
++                index=((index+delta)%rates.size()+rates.size())%rates.size();
++                state->draft.setSampleRate(rates[index]);state->dirty=true;
++            }});
++    }
++    actions.push_back({
++        [state]{return state->dirty?QString("APPLY CHANGES ›"):QString("APPLY (NO CHANGES)");},
++        [this,state,manager]{
++            if(!state->dirty) {m_tools->message("Nothing to apply.");return;}
++            const auto previous=manager->getConfig();
++            const auto status=manager->setConfig(state->draft);
++            if(status==SoundDeviceStatus::Ok) {
++                state->draft.writeToDisk();
++                state->draft=manager->getConfig();state->dirty=false;
++                m_tools->message("Audio configuration applied and saved.");
++            } else {
++                const QString error=manager->getLastErrorMessage(status);
++                manager->setConfig(previous);
++                state->draft=manager->getConfig();state->dirty=false;
++                m_tools->message("Not applied: "+error+" The previous configuration was restored.");
++            }
++            m_tools->refresh();
++        },{}});
++    actions.push_back({
++        []{return QString("RESCAN SOUND CARDS ›");},
++        [this,state,manager]{
++            manager->clearAndQueryDevices();
++            m_tools->message("Sound cards rescanned.");
++            m_tools->refresh();
++        },{}});
++    m_tools->showMenu("AUDIO I/O — SOUND CARDS",std::move(actions),[this]{showUtility();});
++    m_tools->message("Press a line, turn to choose the sound card and channels, press again to finish. Then APPLY.");
++}
+diff --git a/src/widget/wrx3browserutility.h b/src/widget/wrx3browserutility.h
+index 95992f1..41a7824 100644
+--- a/src/widget/wrx3browserutility.h
++++ b/src/widget/wrx3browserutility.h
+@@ -76,6 +76,11 @@ inline void WRx3Browser::showUtility() {
+     shared("DECK","HOT CUE AUTO LOAD","hotcue_autoload",{"OFF","rekordbox SETTING","ON"},{2,1,0});
+     shared("DECK","AUTO CUE LEVEL","auto_cue_level",{"-78 dB","-72 dB","-66 dB","-60 dB","-54 dB","-48 dB","-42 dB","-36 dB","MEMORY"},
+             {-78,-72,-66,-60,-54,-48,-42,-36,0},"Applies to both decks; MEMORY uses the first stored memory cue.");
++    {
++        const auto engines=WRx3Shortcut::keylockChoices();
++        shared("DECK","KEY LOCK ENGINE (PITCH / TIME-STRETCH)","keylock_engine",engines.first,engines.second,
++                "SOUNDTOUCH is light on the CPU; RUBBER BAND is cleaner on vocals and bass (FINER is the highest quality and heaviest). Applies to all decks at once.");
++    }
+     shared("DECK","SLIP FLASHING","slip_flashing",{"OFF","ON"},{0,1});
+     shared("DECK","PLAY MODE","play_mode",{"CONTINUE","SINGLE"},{0,1},"REPEAT and ALL REPEAT are not implemented; available modes are CONTINUE and SINGLE.");
+     action("DECK","PLAYBACK OPTIONS",[this]{showPlaybackTools();});
+@@ -86,6 +91,7 @@ inline void WRx3Browser::showUtility() {
+     shared("MIXER","CHANNEL FADER CURVE","channel_curve",{"CURVE1","CURVE2","CURVE3"},{0,1,2});
+     shared("MIXER","HEADPHONES MONO SPLIT/STEREO","headphones",{"MONO SPLIT","STEREO"},{1,0});
+     action("MIXER","MIXER / MIC / AUX / BOOTH",[this]{showAudioTools();});
++    action("MIXER","AUDIO I/O (SOUND CARDS)",[this]{showSoundCardTools();});
+     action("EFFECTS","BEAT FX",[this]{showBeatFxTools();});
+     action("BROWSER","TAG LIST / TAG TRACK",[this]{showTagTools();});
+     action("BROWSER","PLAYLIST BANK",[this]{showBankTools();});
+diff --git a/src/widget/wrx3shortcut.h b/src/widget/wrx3shortcut.h
+index 3fa2004..a032c06 100644
+--- a/src/widget/wrx3shortcut.h
++++ b/src/widget/wrx3shortcut.h
+@@ -24,6 +24,7 @@
+ #include <cmath>
+ #include <functional>
+ #include "control/controlobject.h"
++#include "engine/enginebuffer.h"
+ #include "control/controlproxy.h"
+ #include "effects/effectsmanager.h"
+ #include "effects/chains/equalizereffectchain.h"
+@@ -228,6 +229,13 @@ class WRx3Shortcut : public QFrame {
+                     waveforms.second.value(0),true);
+             m_rows.back().labels=waveforms.first;
+         }
++        {
++            const auto engines=keylockChoices();
++            if(engines.second.size()>1 && ControlObject::exists(ConfigKey("[App]","keylock_engine"))) {
++                add(right,"KEY LOCK ENGINE","keylock_engine",engines.first,engines.second,engines.second.value(0),true);
++                m_rows.back().labels=engines.first;
++            }
++        }
+         right->addStretch(1);
+         m_status=new QLabel("",this);m_status->setMaximumHeight(40);m_status->setObjectName("ShortcutStatus");m_status->setWordWrap(true);
+         auto* statusRow=new QHBoxLayout;statusRow->addWidget(m_status,1);
+@@ -314,7 +322,7 @@ class WRx3Shortcut : public QFrame {
+             if(m_config->exists(saved)) deckSettings.insert(QString("%1%2").arg(key).arg(deck),m_config->getValue<double>(saved));
+         }
+         for(auto& row:m_rows) if(!row.values.isEmpty() && !row.key.startsWith("display_") &&
+-                row.key!="waveform_type" && row.key!="waveform_color")
++                row.key!="waveform_type" && row.key!="waveform_color" && row.key!="keylock_engine")
+             apply(row.key,ControlObject::get(ConfigKey("[RX3Settings]",row.key)));
+         for(int deck=1;deck<=2;++deck) {
+             const auto key=ConfigKey("[RX3Settings]",QString("quantize%1").arg(deck));
+@@ -407,6 +415,17 @@ class WRx3Shortcut : public QFrame {
+         }
+         return {labels,values};
+     }
++    // Pitch-shift / time-stretch (key lock) engines compiled into this build.
++    static QPair<QStringList,QList<double>> keylockChoices() {
++        QStringList labels;QList<double> values;
++        for(const auto engine:EngineBuffer::kKeylockEngines) {
++            if(!EngineBuffer::isKeylockEngineAvailable(engine)) continue;
++            const QString name=engine==EngineBuffer::KeylockEngine::SoundTouch?QStringLiteral("SOUNDTOUCH"):
++                    engine==EngineBuffer::KeylockEngine::RubberBandFaster?QStringLiteral("RUBBER BAND"):QStringLiteral("RUBBER BAND R3");
++            labels<<name;values<<double(static_cast<int>(engine));
++        }
++        return {labels,values};
++    }
+     // UTILITY and SHORTCUT use the same setting owners and apply path.
+     double utilityValue(const QString& key) const {
+         if(key=="auto_cue_level") {
+@@ -421,6 +440,7 @@ class WRx3Shortcut : public QFrame {
+         if(key=="waveform_divisions") {
+             const auto* factory=WaveformWidgetFactory::instance();return factory?factory->getOverviewDivisions():-999;
+         }
++        if(key=="keylock_engine") return ControlObject::get(ConfigKey("[App]","keylock_engine"));
+         for(const auto& row:m_rows) if(row.key==key) return read(row);
+         return ControlObject::get(ConfigKey("[RX3Settings]",key));
+     }
+@@ -430,6 +450,7 @@ class WRx3Shortcut : public QFrame {
+         if(key=="display_resolution") return ControlObject::exists(ConfigKey("[RX3Window]","apply_resolution"));
+         if(key=="display_mode") return ControlObject::exists(ConfigKey("[RX3Window]","fullscreen"));
+         if(key=="waveform_type") return WaveformWidgetFactory::instance() && !waveformChoices().second.isEmpty();
++        if(key=="keylock_engine") return ControlObject::exists(ConfigKey("[App]","keylock_engine")) && keylockChoices().second.size()>1;
+         if(key=="eq_mode") {
+             if(!m_effects || !m_effects->getBackendManager()->getManifestFromUniqueId("org.mixxx.effects.bessel4lvmixeq") ||
+                     !m_effects->getBackendManager()->getManifestFromUniqueId("org.mixxx.effects.biquadfullkilleq")) return false;
+@@ -460,6 +481,10 @@ class WRx3Shortcut : public QFrame {
+             ControlObject::set(ConfigKey("[RX3Settings]",key),value);
+             m_config->setValue(ConfigKey("[RX3Settings]",key),value);m_config->save();return true;
+         }
++        if(key=="keylock_engine") {
++            if(!keylockChoices().second.contains(value)) return false;
++            apply(key,value);return true;
++        }
+         if(key=="display_resolution" || key=="display_mode" || key=="waveform_type") {
+             // Same owners as the SHORTCUT rows, including persistence.
+             for(auto& row:m_rows) if(row.key==key) {
+@@ -537,7 +562,7 @@ class WRx3Shortcut : public QFrame {
+                     curves?static_cast<QPushButton*>(new Rx3CurveButton(i,key=="crossfader_curve",row.frame)):
+                     new QPushButton(stepper?(i==0?"‹":i==2?"›":"3"):labels[i],row.frame);
+             button->setObjectName("Shortcut_"+key+"_"+QString::number(i));
+-            const bool labelStepper=stepper && key=="waveform_type";
++            const bool labelStepper=stepper && (key=="waveform_type" || key=="keylock_engine");
+             button->setFixedHeight(rx3ui::S(36));
+             button->setFixedWidth(rx3ui::S(labelStepper?(i==1?210:56):key.startsWith("tempo_range")?82:
+                     key=="display_resolution"?66:key=="display_mode"?80:stepper||curves?96:88));
+@@ -558,7 +583,7 @@ class WRx3Shortcut : public QFrame {
+         }
+         choices->addStretch(1);
+         m_rows.push_back(row);
+-        if(!key.startsWith("display_") && key!="waveform_type" && key!="waveform_color")
++        if(!key.startsWith("display_") && key!="waveform_type" && key!="waveform_color" && key!="keylock_engine")
+             apply(key,ControlObject::get(ConfigKey("[RX3Settings]",key)));
+     }
+     void section(QVBoxLayout* layout,const QString& text) {
+@@ -591,6 +616,7 @@ class WRx3Shortcut : public QFrame {
+                 m_config->getValueString(ConfigKey("[Config]","ResizableSkin")));
+         if(row.key=="display_mode") return ControlObject::exists(ConfigKey("[RX3Window]","fullscreen"))?
+                 ControlObject::get(ConfigKey("[RX3Window]","fullscreen")):0;
++        if(row.key=="keylock_engine") return ControlObject::get(ConfigKey("[App]","keylock_engine"));
+         if(row.key=="waveform_type") return WaveformWidgetFactory::instance()?
+                 double(WaveformWidgetFactory::instance()->getType()):-999;
+         if(row.key=="waveform_color") {
+@@ -668,6 +694,10 @@ class WRx3Shortcut : public QFrame {
+                 m_config->setValue(ConfigKey("[RX3Window]","Resolution"),index);m_config->save();
+                 set("[RX3Window]","apply_resolution",1);set("[RX3Window]","apply_resolution",0);
+             }
++        } else if(key=="keylock_engine") {
++            const int engine=qRound(value);
++            set("[App]","keylock_engine",engine);
++            m_config->setValue(ConfigKey("[Master]","keylock_engine"),engine);m_config->save();
+         } else if(key=="display_mode") {
+             set("[RX3Window]","fullscreen",value>0.5?1:0);
+         } else if(key=="waveform_type" && WaveformWidgetFactory::instance()) {

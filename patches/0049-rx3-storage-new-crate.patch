@@ -1,0 +1,37 @@
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index 0eafb27..b01fa7b 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -1367,9 +1367,23 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         return collection->addCrateTracks(crateId,ids)?
+                 QString("Added to crate %1.").arg(name):QStringLiteral("Crate update failed.");
+     }
++    // The RX3 interface has no crate editor, so UTILITY can start the TAG LIST
++    // crate itself; crates made elsewhere in Mixxx appear in the same menu.
++    QString createTagCrate() {
++        auto* collection=storageCollection();
++        if(!collection || !m_toolTrack || !m_toolTrack->getId().isValid()) return QStringLiteral("Select a STORAGE track first.");
++        Crate created;created.setName(QStringLiteral("TAG LIST"));
++        CrateId id;
++        if(!collection->insertCrate(created,&id) || !id.isValid()) return QStringLiteral("TAG LIST crate could not be created.");
++        return toggleStorageCrate(id,QStringLiteral("TAG LIST"),false);
++    }
+     void showStorageCrateTools() {
+         std::vector<ToolAction> actions;
+         const auto crates=storageCrates();
++        auto* collection=storageCollection();
++        if(collection && !collection->crates().readCrateByName(QStringLiteral("TAG LIST")))
++            actions.push_back(toolAction("NEW CRATE: TAG LIST  (ADD SELECTED TRACK)",[this]{
++                const QString result=createTagCrate();showStorageCrateTools();m_tools->message(result);}));
+         for(const auto& crate:crates) {
+             const CrateId id=crate.getId();const QString name=crate.getName();const bool locked=crate.isLocked();
+             actions.push_back(toolAction(locked?name+"  (locked)":name,
+@@ -1378,7 +1392,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         actions.push_back(toolAction("OPEN CRATES",[this]{openStorageCrates();}));
+         m_tools->showMenu("CRATES / TAG TRACK",std::move(actions),[this]{showTools();});
+         m_tools->message(crates.isEmpty()?
+-                QStringLiteral("No crates yet. Create one in the Mixxx Crates view first."):
++                QStringLiteral("No crates yet. NEW CRATE: TAG LIST starts one with the selected track."):
+                 QStringLiteral("Press a crate to add or remove the selected track."));
+     }
+     void openStorageSearch() {

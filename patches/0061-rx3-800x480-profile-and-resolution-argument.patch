@@ -1,0 +1,146 @@
+diff --git a/src/mixxxmainwindow.cpp b/src/mixxxmainwindow.cpp
+index 1f0a15f..7e2dac7 100644
+--- a/src/mixxxmainwindow.cpp
++++ b/src/mixxxmainwindow.cpp
+@@ -95,6 +95,29 @@ const ConfigKey kHideMenuBarConfigKey = ConfigKey("[Config]", "hide_menubar");
+ const ConfigKey kMenuBarHintConfigKey = ConfigKey("[Config]", "show_menubar_hint");
+ } // namespace
+ 
++namespace {
++// --resolution WIDTHxHEIGHT (NauticMixxx): select the matching display
++// profile skin before the launch image and the skin are created. Same effect
++// as SCREEN in UTILITY > DISPLAY (skin + default for the next start).
++void applyCommandLineResolution(const UserSettingsPointer& pConfig) {
++    const QString requested = CmdlineArgs::Instance().getResolution();
++    if (requested.isEmpty()) {
++        return;
++    }
++    const int index = rx3ui::profileIndexForResolution(requested);
++    if (index < 0) {
++        qWarning() << "Unknown --resolution" << requested << "- supported:"
++                   << rx3ui::profileLabels(QStringLiteral(", "));
++        return;
++    }
++    const ConfigValue skin(QString::fromLatin1(rx3ui::kProfiles[index].skin));
++    pConfig->set(ConfigKey("[Config]", "ResizableSkin"), skin);
++    pConfig->set(ConfigKey("[Config]", "Skin"), skin);
++    pConfig->setValue(ConfigKey("[RX3Window]", "Resolution"), index);
++    qInfo() << "Resolution from command line:" << rx3ui::kProfiles[index].label;
++}
++} // namespace
++
+ MixxxMainWindow::MixxxMainWindow(std::shared_ptr<mixxx::CoreServices> pCoreServices)
+         : m_pCoreServices(pCoreServices),
+           m_pCentralWidget(nullptr),
+@@ -115,6 +138,7 @@ MixxxMainWindow::MixxxMainWindow(std::shared_ptr<mixxx::CoreServices> pCoreServi
+           m_pPrefDlg(nullptr),
+           m_toolTipsCfg(mixxx::preferences::Tooltips::On) {
+     DEBUG_ASSERT(pCoreServices);
++    applyCommandLineResolution(m_pCoreServices->getSettings());
+     // These depend on the settings
+ #ifdef __LINUX__
+     // If the desktop features a global menubar and we'll go fullscreen during
+diff --git a/src/util/cmdlineargs.cpp b/src/util/cmdlineargs.cpp
+index b10bc55..7a084be 100644
+--- a/src/util/cmdlineargs.cpp
++++ b/src/util/cmdlineargs.cpp
+@@ -18,6 +18,7 @@
+ #include "defs_urls.h"
+ #include "sources/soundsourceproxy.h"
+ #include "util/assert.h"
++#include "widget/rx3ui.h"
+ 
+ namespace {
+ 
+@@ -230,6 +231,16 @@ bool CmdlineArgs::parse(const QStringList& arguments, CmdlineArgs::ParseMode mod
+     parser.addOption(timelinePath);
+     parser.addOption(timelinePathDeprecated);
+ 
++    const QCommandLineOption resolution(QStringLiteral("resolution"),
++            forUserFeedback ? QCoreApplication::translate("CmdlineArgs",
++                                      "Start with the NauticMixxx skin made for this screen "
++                                      "size: %1. Kept as the default for the next start, "
++                                      "like SCREEN in UTILITY > DISPLAY.")
++                                      .arg(rx3ui::profileLabels())
++                            : QString(),
++            QStringLiteral("WIDTHxHEIGHT"));
++    parser.addOption(resolution);
++
+     const QCommandLineOption enableLegacyVuMeter(QStringLiteral("enable-legacy-vumeter"),
+             forUserFeedback ? QCoreApplication::translate("CmdlineArgs",
+                                       "Use legacy vu meter")
+@@ -400,6 +411,10 @@ bool CmdlineArgs::parse(const QStringList& arguments, CmdlineArgs::ParseMode mod
+ 
+     m_startInFullscreen = parser.isSet(fullScreen) || parser.isSet(fullScreenDeprecated);
+ 
++    if (parser.isSet(resolution)) {
++        m_resolution = parser.value(resolution).trimmed();
++    }
++
+     if (parser.isSet(locale)) {
+         m_locale = parser.value(locale);
+     }
+diff --git a/src/util/cmdlineargs.h b/src/util/cmdlineargs.h
+index 08980b3..762a93c 100644
+--- a/src/util/cmdlineargs.h
++++ b/src/util/cmdlineargs.h
+@@ -30,6 +30,9 @@ class CmdlineArgs final {
+ 
+     const QList<QString>& getMusicFiles() const { return m_musicFiles; }
+     bool getStartInFullscreen() const { return m_startInFullscreen; }
++    // --resolution WIDTHxHEIGHT: NauticMixxx display profile to start with
++    // (empty when not given). Validated by MixxxMainWindow.
++    const QString& getResolution() const { return m_resolution; }
+     bool getStartAutoDJ() const {
+         return m_startAutoDJ;
+     }
+@@ -92,6 +95,7 @@ class CmdlineArgs final {
+ 
+     QList<QString> m_musicFiles;    // List of files to load into players at startup
+     bool m_startInFullscreen;       // Start in fullscreen mode
++    QString m_resolution;           // --resolution WIDTHxHEIGHT (NauticMixxx skin profile)
+     bool m_startAutoDJ;
+     bool m_controllerDebug;
+     bool m_controllerAbortOnWarning; // Controller Engine will be stricter
+diff --git a/src/widget/rx3ui.h b/src/widget/rx3ui.h
+index 904a815..bf2ac7c 100644
+--- a/src/widget/rx3ui.h
++++ b/src/widget/rx3ui.h
+@@ -22,6 +22,7 @@ struct Profile {
+ inline constexpr Profile kProfiles[] = {
+         {"XDJ_RX3_Mixxx", 1280, 800, "1280x800"},
+         {"XDJ_RX3_Mixxx_800x600", 800, 600, "800x600"},
++        {"XDJ_RX3_Mixxx_800x480", 800, 480, "800x480"},
+         {"XDJ_RX3_Mixxx_600x480", 600, 480, "600x480"},
+         {"XDJ_RX3_Mixxx_480x320", 480, 320, "480x320"},
+ };
+@@ -33,6 +34,29 @@ inline int profileIndexForSkin(const QString& skin) {
+     }
+     return -1;
+ }
++// Index of the profile described by "WIDTHxHEIGHT" (also accepts "800 x 480",
++// "800X480", "800*480"); -1 when the text is not a known display profile.
++inline int profileIndexForResolution(const QString& text) {
++    static const QRegularExpression re(
++            QStringLiteral("^\\s*(\\d+)\\s*[xX*\\x{00D7}]\\s*(\\d+)\\s*$"));
++    const auto match = re.match(text);
++    if (!match.hasMatch()) return -1;
++    const int w = match.captured(1).toInt();
++    const int h = match.captured(2).toInt();
++    for (int i = 0; i < kProfileCount; ++i) {
++        if (kProfiles[i].width == w && kProfiles[i].height == h) return i;
++    }
++    return -1;
++}
++// "1280x800|800x600|..." for help and warning texts.
++inline QString profileLabels(const QString& separator = QStringLiteral("|")) {
++    QString out;
++    for (int i = 0; i < kProfileCount; ++i) {
++        if (i) out += separator;
++        out += QLatin1String(kProfiles[i].label);
++    }
++    return out;
++}
+ inline bool isRx3Skin(const QString& skin) { return profileIndexForSkin(skin) >= 0; }
+ // Native size of an RX3 skin (invalid for any other skin).
+ inline QSize skinSize(const QString& skin) {

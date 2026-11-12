@@ -1,0 +1,6 @@
+<Template><PushButton>
+  <ObjectName>RX3ModePad</ObjectName><Rx3ReleaseFxPad>true</Rx3ReleaseFxPad>
+  <Channel><Variable name="channel" /></Channel><Pad><Variable name="pad" /></Pad>
+  <Size>0me,13f</Size><NumberStates>1</NumberStates>
+  <State><Number>0</Number><Text><Variable name="label" /></Text></State>
+</PushButton></Template>

@@ -1,0 +1,1395 @@
+diff --git a/src/mixxxmainwindow.cpp b/src/mixxxmainwindow.cpp
+index c9160e5..560ef9c 100644
+--- a/src/mixxxmainwindow.cpp
++++ b/src/mixxxmainwindow.cpp
+@@ -62,6 +62,7 @@
+ #include "waveform/sharedglcontext.h"
+ #include "waveform/visualsmanager.h"
+ #include "waveform/waveformwidgetfactory.h"
++#include "widget/rx3ui.h"
+ #include "widget/wglwidget.h"
+ #include "widget/wmainmenubar.h"
+ 
+@@ -212,7 +213,7 @@ void MixxxMainWindow::initialize() {
+     // The Fullscreen menu item is refreshed in connectMenuBar()
+     bool fullscreenPref = m_pCoreServices->getSettings()->getValue<bool>(
+             ConfigKey("[Config]", "StartInFullscreen"));
+-    const bool rx3Skin = pConfig->getValueString(ConfigKey("[Config]", "ResizableSkin")) == "XDJ_RX3_Mixxx";
++    const bool rx3Skin = rx3ui::isRx3Skin(pConfig->getValueString(ConfigKey("[Config]", "ResizableSkin")));
+     const ConfigKey rx3LastFullscreen("[RX3Window]", "LastFullscreen");
+ #ifdef __APPLE__
+     const bool rx3Fullscreen = false;
+@@ -339,6 +340,7 @@ void MixxxMainWindow::initialize() {
+ 
+     tryParseAndSetDefaultStyleSheet();
+ 
++    setupRx3DisplayControls();
+     if (!loadConfiguredSkin()) {
+         reportCriticalErrorAndQuit(
+                 "default skin cannot be loaded - see <b>mixxx</b> trace for more information");
+@@ -424,9 +426,9 @@ void MixxxMainWindow::initialize() {
+                 const QSize chrome = size() - m_pCentralWidget->size();
+                 #ifdef __APPLE__
+                 Q_UNUSED(chrome);
+-                setFixedSize(1280,800);
++                setFixedSize(rx3SkinCanvas());
+ #else
+-                resize(QSize(1280,800) + chrome);
++                resize(rx3SkinCanvas() + chrome);
+ #endif
+                 qInfo() << "RX3 windowed canvas:" << m_pCentralWidget->size();
+             }
+@@ -564,6 +566,10 @@ void MixxxMainWindow::checkForStartupUpdate() {
+ MixxxMainWindow::~MixxxMainWindow() {
+     Timer t("~MixxxMainWindow");
+     t.start();
++    delete m_pRx3Fullscreen;
++    delete m_pRx3ApplyResolution;
++    m_pRx3Fullscreen = nullptr;
++    m_pRx3ApplyResolution = nullptr;
+ 
+     // Save the current window state (position, maximized, etc)
+     // Note(ronso0): Unfortunately saveGeometry() also stores the fullscreen state.
+@@ -574,8 +580,8 @@ MixxxMainWindow::~MixxxMainWindow() {
+     // So let's quit fullscreen if StartInFullscreen is not checked in Preferences.
+     bool fullscreenPref = m_pCoreServices->getSettings()->getValue<bool>(
+             ConfigKey("[Config]", "StartInFullscreen"));
+-    const bool rx3Skin = m_pCoreServices->getSettings()->getValueString(
+-            ConfigKey("[Config]", "ResizableSkin")) == "XDJ_RX3_Mixxx";
++    const bool rx3Skin = rx3ui::isRx3Skin(m_pCoreServices->getSettings()->getValueString(
++            ConfigKey("[Config]", "ResizableSkin")));
+     if (rx3Skin) m_pCoreServices->getSettings()->setValue(
+             ConfigKey("[RX3Window]", "LastFullscreen"), isFullScreen());
+     if (isFullScreen() && !fullscreenPref && !rx3Skin) {
+@@ -673,8 +679,8 @@ void MixxxMainWindow::initializeWindow() {
+     // [Config],StartInFullscreen = 1
+     // (slotViewFullScreen(true) in  initialize() is a no-op then)
+ #ifdef __APPLE__
+-    const bool rx3Window=m_pCoreServices->getSettings()->getValueString(
+-            ConfigKey("[Config]","ResizableSkin"))=="XDJ_RX3_Mixxx";
++    const bool rx3Window=rx3ui::isRx3Skin(m_pCoreServices->getSettings()->getValueString(
++            ConfigKey("[Config]","ResizableSkin")));
+     setWindowFlag(Qt::FramelessWindowHint,rx3Window);
+ #endif
+     restoreGeometry(QByteArray::fromBase64(
+@@ -687,7 +693,7 @@ void MixxxMainWindow::initializeWindow() {
+                     .toUtf8()));
+ 
+ #ifdef __APPLE__
+-    if(rx3Window) {setWindowState(Qt::WindowNoState);setFixedSize(1280,800);}
++    if(rx3Window) {setWindowState(Qt::WindowNoState);setFixedSize(rx3SkinCanvas());}
+ #endif
+     setWindowIcon(QIcon(MIXXX_ICON_PATH));
+     slotUpdateWindowTitle(TrackPointer());
+@@ -1226,18 +1232,18 @@ void MixxxMainWindow::slotViewFullScreen(bool toggle) {
+     if (toggle) {
+         // The RX3 window is fixed at 1280x800 only in windowed mode. Keeping
+         // that maximum in fullscreen prevents the reference scaler resizing.
+-        if (m_pCoreServices->getSettings()->getValueString(
+-                    ConfigKey("[Config]", "ResizableSkin")) == "XDJ_RX3_Mixxx") {
+-            setMinimumSize(640, 400);
++        if (rx3ui::isRx3Skin(m_pCoreServices->getSettings()->getValueString(
++                    ConfigKey("[Config]", "ResizableSkin")))) {
++            setMinimumSize(rx3SkinCanvas() / 2);
+             setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+         }
+         showFullScreen();
+     } else {
+         showNormal();
+ #ifdef __APPLE__
+-        if (m_pCoreServices->getSettings()->getValueString(
+-                    ConfigKey("[Config]", "ResizableSkin")) == "XDJ_RX3_Mixxx") {
+-            setFixedSize(1280, 800);
++        if (rx3ui::isRx3Skin(m_pCoreServices->getSettings()->getValueString(
++                    ConfigKey("[Config]", "ResizableSkin")))) {
++            setFixedSize(rx3SkinCanvas());
+         }
+ #endif
+     }
+@@ -1456,6 +1462,77 @@ void MixxxMainWindow::rebootMixxxView() {
+     qDebug() << "rebootMixxxView DONE";
+ }
+ 
++QSize MixxxMainWindow::rx3SkinCanvas() const {
++    const QSize size = rx3ui::skinSize(m_pCoreServices->getSettings()->getValueString(
++            ConfigKey("[Config]", "ResizableSkin")));
++    return size.isValid() ? size : QSize(1280, 800);
++}
++
++void MixxxMainWindow::rx3SizeWindowToSkin() {
++    const bool rx3 = rx3ui::isRx3Skin(m_pCoreServices->getSettings()->getValueString(
++            ConfigKey("[Config]", "ResizableSkin")));
++    if (!rx3 || isFullScreen()) {
++        return;
++    }
++    setMinimumSize(0, 0);
++    setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
++#ifdef __APPLE__
++    setFixedSize(rx3SkinCanvas());
++#else
++    // Only the menu bar (when shown) sits outside the skin canvas.
++    const QSize chrome(0, menuBar() && menuBar()->isVisible() ? menuBar()->height() : 0);
++    resize(rx3SkinCanvas() + chrome);
++#endif
++}
++
++void MixxxMainWindow::setupRx3DisplayControls() {
++    if (m_pRx3Fullscreen) {
++        return;
++    }
++    const auto pConfig = m_pCoreServices->getSettings();
++    m_pRx3Fullscreen = new ControlObject(
++            ConfigKey("[RX3Window]", "fullscreen"), false, false, false, isFullScreen() ? 1 : 0);
++    m_pRx3ApplyResolution = new ControlObject(
++            ConfigKey("[RX3Window]", "apply_resolution"), false, false, false, 0);
++    auto* fullscreen = new ControlProxy(ConfigKey("[RX3Window]", "fullscreen"), this);
++    fullscreen->connectValueChanged(this, [this](double value) {
++        // Never change the window while one of its own widgets is still on
++        // the call stack of the request.
++        QTimer::singleShot(0, this, [this, value] {
++            m_pCoreServices->getSettings()->setValue(
++                    ConfigKey("[RX3Window]", "LastFullscreen"), value > 0.5);
++            slotViewFullScreen(value > 0.5);
++            if (value <= 0.5) {
++                QTimer::singleShot(50, this, [this] { rx3SizeWindowToSkin(); });
++            }
++        });
++    });
++    auto* apply = new ControlProxy(ConfigKey("[RX3Window]", "apply_resolution"), this);
++    apply->connectValueChanged(this, [this](double value) {
++        if (value > 0.5) {
++            QTimer::singleShot(0, this, [this] { rx3ApplyResolution(); });
++        }
++    });
++    Q_UNUSED(pConfig);
++}
++
++void MixxxMainWindow::rx3ApplyResolution() {
++    const auto pConfig = m_pCoreServices->getSettings();
++    const int index = pConfig->getValue<int>(ConfigKey("[RX3Window]", "Resolution"), 0);
++    if (index < 0 || index >= rx3ui::kProfileCount) {
++        return;
++    }
++    const QString skin = QString::fromLatin1(rx3ui::kProfiles[index].skin);
++    if (pConfig->getValueString(ConfigKey("[Config]", "ResizableSkin")) != skin) {
++        pConfig->set(ConfigKey("[Config]", "ResizableSkin"), ConfigValue(skin));
++        pConfig->set(ConfigKey("[Config]", "Skin"), ConfigValue(skin));
++        pConfig->save();
++        rebootMixxxView();
++    }
++    // The rebuilt skin needs a moment to lay out before the window is fitted.
++    QTimer::singleShot(200, this, [this] { rx3SizeWindowToSkin(); });
++}
++
+ bool MixxxMainWindow::loadConfiguredSkin() {
+     // TODO: use std::shared_ptr throughout skin widgets instead of these hacky get() calls
+     m_pCentralWidget = m_pSkinLoader->loadConfiguredSkin(this,
+@@ -1522,16 +1599,19 @@ bool MixxxMainWindow::eventFilter(QObject* obj, QEvent* event) {
+         const bool wasFullScreen = changeEvent->oldState() & Qt::WindowFullScreen;
+         const bool isFullScreenNow = windowState() & Qt::WindowFullScreen;
+ #ifdef __APPLE__
+-        if (m_pCoreServices && m_pCoreServices->getSettings()->getValueString(
+-                    ConfigKey("[Config]", "ResizableSkin")) == "XDJ_RX3_Mixxx") {
++        if (m_pCoreServices && rx3ui::isRx3Skin(m_pCoreServices->getSettings()->getValueString(
++                    ConfigKey("[Config]", "ResizableSkin")))) {
+             if (isFullScreenNow) {
+-                setMinimumSize(640, 400);
++                setMinimumSize(rx3SkinCanvas() / 2);
+                 setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+             } else if (wasFullScreen) {
+-                QTimer::singleShot(0, this, [this] { if (!isFullScreen()) setFixedSize(1280, 800); });
++                QTimer::singleShot(0, this, [this] { if (!isFullScreen()) setFixedSize(rx3SkinCanvas()); });
+             }
+         }
+ #endif
++        if (m_pRx3Fullscreen && isFullScreenNow != wasFullScreen) {
++            m_pRx3Fullscreen->set(isFullScreenNow ? 1 : 0);
++        }
+         if ((isFullScreenNow && !wasFullScreen) ||
+                 (!isFullScreenNow && wasFullScreen)) {
+ #ifdef __LINUX__
+diff --git a/src/mixxxmainwindow.h b/src/mixxxmainwindow.h
+index 834ee87..057457a 100644
+--- a/src/mixxxmainwindow.h
++++ b/src/mixxxmainwindow.h
+@@ -112,6 +112,16 @@ class MixxxMainWindow : public QMainWindow {
+     bool loadConfiguredSkin();
+     void tryParseAndSetDefaultStyleSheet();
+ 
++    // NauticMixxx display profiles (patch 0050): the RX3 skins come in
++    // several native resolutions. These helpers back the UTILITY / SHORTCUT
++    // RESOLUTION and DISPLAY MODE settings.
++    QSize rx3SkinCanvas() const;
++    void setupRx3DisplayControls();
++    void rx3ApplyResolution();
++    void rx3SizeWindowToSkin();
++    ControlObject* m_pRx3Fullscreen = nullptr;
++    ControlObject* m_pRx3ApplyResolution = nullptr;
++
+     bool confirmExit();
+ #ifndef __APPLE__
+     void alwaysHideMenuBarDlg();
+diff --git a/src/preferences/dialog/dlgprefwaveform.cpp b/src/preferences/dialog/dlgprefwaveform.cpp
+index 8a0155c..53c4cc9 100644
+--- a/src/preferences/dialog/dlgprefwaveform.cpp
++++ b/src/preferences/dialog/dlgprefwaveform.cpp
+@@ -1,4 +1,5 @@
+ #include "preferences/dialog/dlgprefwaveform.h"
++#include "widget/rx3waveform.h"
+ 
+ #include <QMetaEnum>
+ 
+@@ -54,6 +55,10 @@ DlgPrefWaveform::DlgPrefWaveform(
+             waveformTypeComboBox->addItem(tr("3Band (3 Bandas)"), i);
+             break;
+         default:
++            if (rx3::selectableWaveformType(handles[i].getType())) {
++                waveformTypeComboBox->addItem(
++                        rx3::waveformTypeLabel(handles[i].getType()), i);
++            }
+             break;
+         }
+     }
+@@ -254,8 +259,9 @@ void DlgPrefWaveform::slotUpdate() {
+ 
+ void DlgPrefWaveform::slotApply() {
+     WaveformSettings waveformSettings(m_pConfig);
+-    waveformSettings.setWaveformCachingEnabled(false);
+-    waveformSettings.setWaveformGenerationWithAnalysisEnabled(false);
++    // Stored summaries feed the STORAGE browser thumbnails (patch 0050).
++    waveformSettings.setWaveformCachingEnabled(true);
++    waveformSettings.setWaveformGenerationWithAnalysisEnabled(true);
+ }
+ 
+ void DlgPrefWaveform::slotResetToDefaults() {
+@@ -291,8 +297,8 @@ void DlgPrefWaveform::slotResetToDefaults() {
+     frameRateSlider->setValue(60);
+     endOfTrackWarningTimeSlider->setValue(30);
+ 
+-    enableWaveformCaching->setChecked(false);
+-    enableWaveformGenerationWithAnalysis->setChecked(false);
++    enableWaveformCaching->setChecked(true);
++    enableWaveformGenerationWithAnalysis->setChecked(true);
+     untilMarkShowBeatsCheckBox->setChecked(true);
+     untilMarkShowTimeCheckBox->setChecked(false);
+ 
+diff --git a/src/preferences/settingsmanager.cpp b/src/preferences/settingsmanager.cpp
+index ec28591..19d7285 100644
+--- a/src/preferences/settingsmanager.cpp
++++ b/src/preferences/settingsmanager.cpp
+@@ -11,6 +11,7 @@
+ #include "preferences/upgrade.h"
+ #include "util/assert.h"
+ #include "waveform/widgets/waveformwidgettype.h"
++#include "widget/rx3waveform.h"
+ 
+ namespace {
+ #ifdef Q_OS_MACOS
+@@ -80,8 +81,10 @@ void applyNauticUsbPolicy(const UserSettingsPointer& settings) {
+     // USB sources keep their own read-only track policy.
+     set("[Library]", "UsbOnlyMode", 0);
+     set("[Library]", "RescanOnStartup", 0);
+-    set("[Library]", "EnableWaveformCaching", 0);
+-    set("[Library]", "EnableWaveformGenerationWithAnalysis", 0);
++    // Keep analysed waveforms: the browser thumbnails of STORAGE tracks are
++    // read from the stored summaries (patch 0050).
++    set("[Library]", "EnableWaveformCaching", 1);
++    set("[Library]", "EnableWaveformGenerationWithAnalysis", 1);
+     set("[Library]", "ShowRekordboxLibrary", 1);
+     for (const char* key : {"ShowBansheeLibrary", "ShowITunesLibrary",
+                  "ShowRhythmboxLibrary", "ShowSeratoLibrary", "ShowTraktorLibrary"}) {
+@@ -110,20 +113,15 @@ void applyNauticUsbPolicy(const UserSettingsPointer& settings) {
+     set("[Waveform]", "OverviewNormalized", 1);
+     set("[Waveform]", "UntilMarkShowBeats", 1);
+     set("[Waveform]", "UntilMarkShowTime", 0);
++    // Every stock, non-deprecated waveform renderer may be chosen (patch 0050);
++    // anything else (including a corrupted value) falls back to the RX3 default.
+     const ConfigKey waveformType("[Waveform]", "WaveformType");
+     const int type = settings->getValue(waveformType,
+             static_cast<int>(WaveformWidgetType::AllShaderRGBStackedWaveform));
+-    if (type != WaveformWidgetType::AllShaderSimpleWaveform &&
+-            type != WaveformWidgetType::AllShaderRGBWaveform &&
+-            type != WaveformWidgetType::AllShaderRGBStackedWaveform) {
++    if (!rx3::selectableWaveformType(static_cast<WaveformWidgetType::Type>(type))) {
+         settings->setValue(waveformType,
+                 static_cast<int>(WaveformWidgetType::AllShaderRGBStackedWaveform));
+     }
+-    if (type == WaveformWidgetType::AllShaderSimpleWaveform ||
+-            type == WaveformWidgetType::AllShaderRGBWaveform ||
+-            type == WaveformWidgetType::AllShaderRGBStackedWaveform) {
+-        settings->setValue(waveformType, type);
+-    }
+     set("[Master]", "keylock_engine", 2);
+ }
+ } // namespace
+diff --git a/src/skin/legacy/legacyskinparser.cpp b/src/skin/legacy/legacyskinparser.cpp
+index 6668d27..8a755ec 100644
+--- a/src/skin/legacy/legacyskinparser.cpp
++++ b/src/skin/legacy/legacyskinparser.cpp
+@@ -63,6 +63,7 @@
+ #include "widget/wreferencescaler.h"
+ #include "widget/rx3displaystate.h"
+ #include "widget/wrx3shortcut.h"
++#include "widget/rx3ui.h"
+ #include "widget/wrx3beatfx.h"
+ #include "widget/wrx3info.h"
+ #include "widget/wrx3emergency.h"
+@@ -410,6 +411,12 @@ QWidget* LegacySkinParser::parseSkin(const QString& skinPath, QWidget* pParent)
+     }
+ 
+     std::unique_ptr<Rx3DisplayState> rx3State;
++    {
++        // Density of this skin relative to the 1280x800 master (patch 0050).
++        bool densityOk = false;
++        const double density = m_pContext->selectString(skinDocument, "Rx3UiScale").toDouble(&densityOk);
++        rx3ui::setDensity(densityOk ? density : 1.0);
++    }
+     if (m_pContext->selectBool(skinDocument, "Rx3DisplayState", false)) {
+         rx3State = std::make_unique<Rx3DisplayState>();
+         if (m_pPlayerManager) {
+diff --git a/src/widget/rx3ui.h b/src/widget/rx3ui.h
+new file mode 100644
+index 0000000..904a815
+--- /dev/null
++++ b/src/widget/rx3ui.h
+@@ -0,0 +1,82 @@
++#pragma once
++
++#include <QRegularExpression>
++#include <QSize>
++#include <QString>
++#include <QtGlobal>
++#include <cmath>
++
++// Display profiles of NauticMixxx. The 1280x800 skin is the master design;
++// smaller skins declare <Rx3UiScale> (their density relative to the master)
++// and every native RX3 widget derives its fixed lengths from it, so the
++// same code serves all screen sizes.
++namespace rx3ui {
++
++struct Profile {
++    const char* skin;
++    int width;
++    int height;
++    const char* label;
++};
++
++inline constexpr Profile kProfiles[] = {
++        {"XDJ_RX3_Mixxx", 1280, 800, "1280x800"},
++        {"XDJ_RX3_Mixxx_800x600", 800, 600, "800x600"},
++        {"XDJ_RX3_Mixxx_600x480", 600, 480, "600x480"},
++        {"XDJ_RX3_Mixxx_480x320", 480, 320, "480x320"},
++};
++inline constexpr int kProfileCount = int(sizeof(kProfiles) / sizeof(kProfiles[0]));
++
++inline int profileIndexForSkin(const QString& skin) {
++    for (int i = 0; i < kProfileCount; ++i) {
++        if (skin == QLatin1String(kProfiles[i].skin)) return i;
++    }
++    return -1;
++}
++inline bool isRx3Skin(const QString& skin) { return profileIndexForSkin(skin) >= 0; }
++// Native size of an RX3 skin (invalid for any other skin).
++inline QSize skinSize(const QString& skin) {
++    const int index = profileIndexForSkin(skin);
++    return index < 0 ? QSize() : QSize(kProfiles[index].width, kProfiles[index].height);
++}
++
++inline double& densityRef() {
++    static double value = 1.0;
++    return value;
++}
++inline double density() { return densityRef(); }
++inline void setDensity(double value) {
++    densityRef() = std::isfinite(value) ? qBound(0.25, value, 2.0) : 1.0;
++}
++inline bool compact() { return density() < 0.85; }
++// A length (spacing, height, width) at the current density; never below 1px.
++inline int S(int value) { return qMax(1, qRound(value * density())); }
++// Text size at the current density, with a legibility floor.
++inline int F(int value, int floor = 9) {
++    if (density() < 0.5) floor = qMin(floor, 7);
++    return qMax(floor, qRound(value * qMax(density(), 0.55)));
++}
++
++// Rescales every pixel length in a stylesheet fragment to the current skin
++// density (text keeps a legibility floor). Identity at density 1.
++inline QString qss(const QString& style) {
++    if (qFuzzyCompare(density(), 1.0)) return style;
++    static const QRegularExpression px(QStringLiteral("(font(?:-size)?:\\s*(?:(?:bold|italic|normal)\\s+)*)?(-?\\d+(?:\\.\\d+)?)px"));
++    QString out;
++    qsizetype last = 0;
++    auto it = px.globalMatch(style);
++    while (it.hasNext()) {
++        const auto m = it.next();
++        out += style.mid(last, m.capturedStart() - last);
++        const int value = qRound(m.captured(2).toDouble());
++        if (m.capturedLength(1) > 0) {
++            out += m.captured(1) + QString::number(F(value)) + QStringLiteral("px");
++        } else {
++            out += QString::number(value == 0 ? 0 : S(value)) + QStringLiteral("px");
++        }
++        last = m.capturedEnd();
++    }
++    return out + style.mid(last);
++}
++
++} // namespace rx3ui
+diff --git a/src/widget/rx3waveform.h b/src/widget/rx3waveform.h
+index fd992ba..2a73e2b 100644
+--- a/src/widget/rx3waveform.h
++++ b/src/widget/rx3waveform.h
+@@ -180,6 +180,59 @@ inline mixxx::rekordbox::WaveformMode waveformModeForType(WaveformWidgetType::Ty
+     }
+ }
+ 
++
++// Waveform styles offered by NauticMixxx (patch 0050): every stock Mixxx
++// renderer that is not deprecated or developer-only. The OpenGL "all-shader"
++// family is listed first; availability on the running system is decided by
++// WaveformWidgetFactory::getAvailableTypes().
++inline bool selectableWaveformType(WaveformWidgetType::Type type) {
++    switch (type) {
++    case WaveformWidgetType::AllShaderSimpleWaveform:
++    case WaveformWidgetType::AllShaderFilteredWaveform:
++    case WaveformWidgetType::AllShaderRGBWaveform:
++    case WaveformWidgetType::AllShaderLRRGBWaveform:
++    case WaveformWidgetType::AllShaderRGBStackedWaveform:
++    case WaveformWidgetType::AllShaderHSVWaveform:
++    case WaveformWidgetType::AllShaderTexturedFiltered:
++    case WaveformWidgetType::AllShaderTexturedRGB:
++    case WaveformWidgetType::AllShaderTexturedStacked:
++    case WaveformWidgetType::SoftwareSimpleWaveform:
++    case WaveformWidgetType::SoftwareWaveform:
++    case WaveformWidgetType::RGBWaveform:
++    case WaveformWidgetType::HSVWaveform:
++    case WaveformWidgetType::QtSimpleWaveform:
++    case WaveformWidgetType::QtWaveform:
++    case WaveformWidgetType::QtRGBWaveform:
++    case WaveformWidgetType::QtHSVWaveform:
++        return true;
++    default:
++        return false;
++    }
++}
++// Short, touch-friendly name; empty when the type is not offered.
++inline QString waveformTypeLabel(WaveformWidgetType::Type type) {
++    switch (type) {
++    case WaveformWidgetType::AllShaderSimpleWaveform: return QStringLiteral("SIMPLE");
++    case WaveformWidgetType::AllShaderFilteredWaveform: return QStringLiteral("FILTERED");
++    case WaveformWidgetType::AllShaderRGBWaveform: return QStringLiteral("RGB");
++    case WaveformWidgetType::AllShaderLRRGBWaveform: return QStringLiteral("L/R RGB");
++    case WaveformWidgetType::AllShaderRGBStackedWaveform: return QStringLiteral("STACKED");
++    case WaveformWidgetType::AllShaderHSVWaveform: return QStringLiteral("HSV");
++    case WaveformWidgetType::AllShaderTexturedFiltered: return QStringLiteral("TEXTURED FILTERED");
++    case WaveformWidgetType::AllShaderTexturedRGB: return QStringLiteral("TEXTURED RGB");
++    case WaveformWidgetType::AllShaderTexturedStacked: return QStringLiteral("TEXTURED STACKED");
++    case WaveformWidgetType::SoftwareSimpleWaveform: return QStringLiteral("SOFTWARE SIMPLE");
++    case WaveformWidgetType::SoftwareWaveform: return QStringLiteral("SOFTWARE FILTERED");
++    case WaveformWidgetType::RGBWaveform: return QStringLiteral("SOFTWARE RGB");
++    case WaveformWidgetType::HSVWaveform: return QStringLiteral("SOFTWARE HSV");
++    case WaveformWidgetType::QtSimpleWaveform: return QStringLiteral("QT SIMPLE");
++    case WaveformWidgetType::QtWaveform: return QStringLiteral("QT FILTERED");
++    case WaveformWidgetType::QtRGBWaveform: return QStringLiteral("QT RGB");
++    case WaveformWidgetType::QtHSVWaveform: return QStringLiteral("QT HSV");
++    default: return QString();
++    }
++}
++
+ // Same small, upward-pointing marker in detail waveforms and deck overviews.
+ inline QRectF positionTriangleRect(qreal x, qreal bottom, qreal scale = 1) {
+     return QRectF(x - 4 * scale, bottom - 7 * scale, 8 * scale, 7 * scale);
+diff --git a/src/widget/wrx3beatfx.h b/src/widget/wrx3beatfx.h
+index 6577543..2fc7973 100644
+--- a/src/widget/wrx3beatfx.h
++++ b/src/widget/wrx3beatfx.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "widget/rx3ui.h"
++
+ #include <QHideEvent>
+ #include <QFontInfo>
+ #include <QHBoxLayout>
+@@ -226,13 +228,13 @@ class WRx3BeatFx : public QWidget {
+             : QWidget(parent), m_config(config), m_effects(effects) {
+         setObjectName("RX3BeatFxControls");
+         auto* row = new QHBoxLayout(this);
+-        row->setContentsMargins(0, 0, 0, 0);
+-        row->setSpacing(12);
++        row->setContentsMargins(0,0,0,0);
++        row->setSpacing(rx3ui::S(12));
+         auto* bank = new QVBoxLayout;
+-        bank->setSpacing(2);
++        bank->setSpacing(rx3ui::S(2));
+         bank->addWidget(caption("BEAT FX SELECT"));
+         auto* bankRow = new QHBoxLayout;
+-        bankRow->setSpacing(8);
++        bankRow->setSpacing(rx3ui::S(8));
+         bank->addLayout(bankRow);
+         for (int index = 0; index < 4; ++index) {
+             m_ids[index] = m_config->getValueString(bankKey(index));
+@@ -240,8 +242,8 @@ class WRx3BeatFx : public QWidget {
+             button->edit = [this, index] { chooseEffect(index); };
+             button->setObjectName(QString("RX3BankSlot%1").arg(index + 1));
+             button->setProperty("rx3Bank", true);
+-            button->setMinimumWidth(0);
+-            button->setFixedHeight(40);
++            button->setMinimumWidth(rx3ui::S(0));
++            button->setFixedHeight(rx3ui::S(40));
+             bankRow->addWidget(button, 1);
+             m_buttons[index] = button;
+             connect(button, &QPushButton::clicked, this, [this, index] { useBank(index); });
+@@ -249,16 +251,16 @@ class WRx3BeatFx : public QWidget {
+         m_delete = new QPushButton(QString::fromUtf8("⌫"), this);
+         m_delete->setObjectName("RX3BankDelete");
+         m_delete->setCheckable(true);
+-        m_delete->setFixedSize(36, 40);
++        m_delete->setFixedSize(rx3ui::S(36),rx3ui::S(40));
+         m_delete->setToolTip("Delete a bank registration: touch this button, then its slot.");
+         connect(m_delete, &QPushButton::toggled, this, [this] { refresh(); });
+         bankRow->addWidget(m_delete);
+         row->addLayout(bank, 1);
+         auto* pad = new QVBoxLayout;
+-        pad->setSpacing(2);
++        pad->setSpacing(rx3ui::S(2));
+         pad->addWidget(caption("X-PAD"));
+         m_pad = new WRx3XPad(this);
+-        m_pad->setFixedHeight(40);
++        m_pad->setFixedHeight(rx3ui::S(40));
+         m_pad->activateCell = [this](double value) {
+             if (!m_slot || !m_parameter) return;
+             // A zero Pitch Shift range cannot transpose. Initialize one octave
+@@ -459,7 +461,7 @@ class WRx3BeatFx : public QWidget {
+         auto* label = new QLabel(text, this);
+         label->setObjectName("RX3StripCaption");
+         label->setAlignment(Qt::AlignCenter);
+-        label->setFixedHeight(16);
++        label->setFixedHeight(rx3ui::S(16));
+         return label;
+     }
+     void releasePad() {
+diff --git a/src/widget/wrx3browser.h b/src/widget/wrx3browser.h
+index b01fa7b..a50773b 100644
+--- a/src/widget/wrx3browser.h
++++ b/src/widget/wrx3browser.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "widget/rx3ui.h"
++
+ #include <QLabel>
+ #include <QCoreApplication>
+ #include <QDir>
+@@ -24,6 +26,7 @@
+ #include <QPainter>
+ #include <QStyledItemDelegate>
+ #include <QScroller>
++#include "analyzer/analyzerscheduledtrack.h"
+ #include "library/library.h"
+ #include "library/rekordbox/rekordboxfeature.h"
+ #include "library/trackcollectionmanager.h"
+@@ -131,11 +134,11 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+             : QWidget(parent), WBaseWidget(this), m_config(std::move(config)), m_library(library), m_backend(backend), m_sidebar(sidebar) {
+         setObjectName("RX3NativeBrowser");
+         auto* layout = new QVBoxLayout(this);
+-        layout->setContentsMargins(0,0,0,0); layout->setSpacing(0);
++        layout->setContentsMargins(0,0,0,0); layout->setSpacing(rx3ui::S(0));
+         auto* header = new QWidget(this); header->setObjectName("RX3BrowserHeader");
+         m_headerWidget=header;
+-        auto* headerLayout=new QVBoxLayout(header);headerLayout->setContentsMargins(0,0,0,0);headerLayout->setSpacing(0);
+-        auto* h = new QHBoxLayout;h->setContentsMargins(0,0,0,0);h->setSpacing(4);headerLayout->addLayout(h);
++        auto* headerLayout=new QVBoxLayout(header);headerLayout->setContentsMargins(0,0,0,0);headerLayout->setSpacing(rx3ui::S(0));
++        auto* h = new QHBoxLayout;h->setContentsMargins(0,0,0,0);h->setSpacing(rx3ui::S(4));headerLayout->addLayout(h);
+         m_source = new QPushButton("SOURCE", header); m_source->setObjectName("RX3SourceButton");
+         h->addWidget(m_source);
+         m_headerButtons.push_back(m_source);
+@@ -174,7 +177,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         layout->addWidget(header);
+         m_pages = new QStackedWidget(this); layout->addWidget(m_pages, 1);
+         auto* browse = new QWidget(m_pages); auto* b = new QHBoxLayout(browse);
+-        b->setContentsMargins(0,0,0,0); b->setSpacing(0);
++        b->setContentsMargins(0,0,0,0); b->setSpacing(rx3ui::S(0));
+         m_categories = new QListWidget(browse); m_categories->setObjectName("RX3BrowserCategories");
+         m_categories->setItemDelegate(new Rx3CategoryDelegate(m_categories));
+         m_categories->setFrameShape(QFrame::NoFrame);
+@@ -194,15 +197,15 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_sidebar->setHeaderHidden(true); m_sidebar->setAlternatingRowColors(true);
+         m_leftColumn=new QWidget(browse);
+         auto* columnLayout=new QHBoxLayout(m_leftColumn);
+-        columnLayout->setContentsMargins(0,0,0,0);columnLayout->setSpacing(0);
++        columnLayout->setContentsMargins(0,0,0,0);columnLayout->setSpacing(rx3ui::S(0));
+         auto* leftRows=new QWidget(m_leftColumn);
+         columnLayout->addWidget(leftRows,1);
+         auto* divider=new QWidget(m_leftColumn);
+         divider->setObjectName("RX3BrowseColumnDivider");
+-        divider->setFixedWidth(1);divider->setStyleSheet("background:#777777;");
++        divider->setFixedWidth(rx3ui::S(1));divider->setStyleSheet("background:#777777;");
+         columnLayout->addWidget(divider);
+         auto* leftLayout=new QVBoxLayout(leftRows);
+-        leftLayout->setContentsMargins(0,0,0,0);leftLayout->setSpacing(0);
++        leftLayout->setContentsMargins(0,0,0,0);leftLayout->setSpacing(rx3ui::S(0));
+         m_leftHeader=new QLabel("FOLDER",m_leftColumn);m_leftHeader->setObjectName("RX3BrowseColumnHeader");
+         leftLayout->addWidget(m_leftHeader);leftLayout->addWidget(m_sidebar,1);
+         b->addWidget(m_leftColumn,1);
+@@ -219,7 +222,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_loading=new QLabel("Reading USB…",browse);m_loading->setObjectName("RX3BrowserLoading");m_loading->setAlignment(Qt::AlignCenter);m_loading->hide();b->addWidget(m_loading,1);
+         m_preview=new QWidget(browse);m_preview->setObjectName("RX3PlaylistPreview");
+         auto* previewLayout=new QVBoxLayout(m_preview);
+-        previewLayout->setContentsMargins(0,0,0,0);previewLayout->setSpacing(0);
++        previewLayout->setContentsMargins(0,0,0,0);previewLayout->setSpacing(rx3ui::S(0));
+         m_previewTracks=new Rx3PreviewTable(m_preview);
+         m_previewTracks->setObjectName("RX3PlaylistPreviewTracks");
+         m_previewTracks->setColumnCount(1);
+@@ -257,7 +260,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_leftColumn->installEventFilter(this);
+         m_previewTracks->installEventFilter(this);
+         auto* sourcePage = new QWidget(m_pages); auto* sl = new QHBoxLayout(sourcePage);
+-        sl->setContentsMargins(0,0,0,0); sl->setSpacing(0);
++        sl->setContentsMargins(0,0,0,0); sl->setSpacing(rx3ui::S(0));
+         m_sources = new Rx3SourceTree(sourcePage); m_sources->setObjectName("RX3BrowserSources");
+         m_sources->setItemDelegate(new Rx3SourceDelegate(m_sources));
+         QScroller::grabGesture(m_sources->viewport(),QScroller::TouchGesture);
+@@ -266,15 +269,15 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         m_info = new QLabel(sourcePage); m_info->setObjectName("RX3SourceInfo"); m_info->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+         m_info->setText("INFO");
+         auto* sourceInfoPanel=new QWidget(sourcePage);sourceInfoPanel->setObjectName("RX3SourceInfoPanel");
+-        auto* sourceInfoLayout=new QVBoxLayout(sourceInfoPanel);sourceInfoLayout->setContentsMargins(12,0,12,0);
+-        sourceInfoLayout->setSpacing(0);
++        auto* sourceInfoLayout=new QVBoxLayout(sourceInfoPanel);sourceInfoLayout->setContentsMargins(rx3ui::S(12),0,rx3ui::S(12),0);
++        sourceInfoLayout->setSpacing(rx3ui::S(0));
+         m_sourceDetails=new QStackedWidget(sourceInfoPanel);sourceInfoLayout->addWidget(m_sourceDetails,3);
+         m_sourceDetails->addWidget(m_info);
+         m_sourceMenu=new WRx3ToolMenu(m_sourceDetails);m_sourceDetails->addWidget(m_sourceMenu);
+         m_sourceMenu->findChild<QListWidget*>("RX3ToolsActions")->setObjectName("RX3SourceSettingsActions");
+         m_sourceMenu->findChild<QPushButton*>("RX3ToolsBack")->setObjectName("RX3SourceSettingsBack");
+-        m_sourceMenu->findChild<QLabel*>("RX3ToolsStatus")->setFixedHeight(64);
+-        m_sourceMenu->setStyleSheet("#RX3BrowserTools {background:#202020;color:white;} #RX3BrowserTools QLabel {color:white;font-family:Arial;font-size:16px;} #RX3BrowserTools QListWidget {background:#202020;color:white;border:1px solid #aaa;font-family:Arial;font-size:19px;} #RX3BrowserTools QPushButton {background:#202020;color:white;border:1px solid #aaa;min-height:36px;} #RX3SourceSettingsBack[encoderFocus=\"true\"] {background:#007CE0;}");
++        m_sourceMenu->findChild<QLabel*>("RX3ToolsStatus")->setFixedHeight(rx3ui::S(64));
++        m_sourceMenu->setStyleSheet(rx3ui::qss(QString("#RX3BrowserTools {background:#202020;color:white;} #RX3BrowserTools QLabel {color:white;font-family:Arial;font-size:16px;} #RX3BrowserTools QListWidget {background:#202020;color:white;border:1px solid #aaa;font-family:Arial;font-size:19px;} #RX3BrowserTools QPushButton {background:#202020;color:white;border:1px solid #aaa;min-height:36px;} #RX3SourceSettingsBack[encoderFocus=\"true\"] {background:#007CE0;}")));
+         m_sourceSettings=new QPushButton("MY SETTINGS MENU",sourceInfoPanel);m_sourceSettings->setObjectName("RX3SourceSettings");
+         sourceInfoLayout->addWidget(m_sourceSettings);sourceInfoLayout->addStretch(1);
+         connect(m_sourceSettings,&QPushButton::clicked,this,[this]{openSourceSettings();});
+@@ -433,7 +436,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     }
+     void resizeEvent(QResizeEvent* event) override {
+         QWidget::resizeEvent(event);
+-        const double scale = qMax(0.6, height()/690.0);
++        const double scale = qMax(0.3, height()/690.0);
+         m_categories->setFixedWidth(qRound(96*scale));
+         m_searchRail->setFixedWidth(qRound(96*scale));m_searchRail->item(0)->setSizeHint(QSize(qRound(96*scale),qRound(65*scale)));
+         m_headerWidget->setFixedHeight(qRound(78*scale));
+@@ -529,7 +532,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     }
+     void createKeyboard(QVBoxLayout* layout) {
+         m_keyboard=new QWidget(this);m_keyboard->setObjectName("RX3SearchKeyboard");
+-        auto* keys=new QGridLayout(m_keyboard);keys->setContentsMargins(10,8,10,8);keys->setSpacing(6);
++        auto* keys=new QGridLayout(m_keyboard);keys->setContentsMargins(rx3ui::S(10),rx3ui::S(8),rx3ui::S(10),rx3ui::S(8));keys->setSpacing(rx3ui::S(6));
+         auto add=[this,keys](const QString& text,int row,int col,int span=1) {
+             auto* button=new QPushButton(text,m_keyboard);button->setFocusPolicy(Qt::NoFocus);
+             button->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Expanding);
+@@ -632,7 +635,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         for(const auto& category : categories) {
+             const auto label = category.label.toUpper();
+             auto* item=new QListWidgetItem("\n" + label,m_categories);
+-            item->setTextAlignment(Qt::AlignCenter);item->setSizeHint(QSize(94,65));
++            item->setTextAlignment(Qt::AlignCenter);item->setSizeHint(QSize(rx3ui::S(94),rx3ui::S(65)));
+             if(category.id == previous) selected=m_categoryIds.size();
+             m_categoryIds.append(category.id);
+         }
+@@ -926,7 +929,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+                     ? value+QStringLiteral(" (%1)").arg(key.section(':',1)) : value;
+             m_facetTracks.insert(label,groups.value(key));
+             auto* item=new QListWidgetItem(label,m_facets);
+-            item->setSizeHint(QSize(260,44));
++            item->setSizeHint(QSize(rx3ui::S(260),rx3ui::S(44)));
+         }
+ 
+         m_level=BrowserLevel::FacetValues;m_sidebar->hide();m_library->hide();
+@@ -951,7 +954,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+             for(const auto id:history.trackIds) if(tracks.contains(id)) ids.append(id);
+             m_facetTracks.insert(label,ids);
+             auto* item=new QListWidgetItem(label,m_facets);
+-            item->setSizeHint(QSize(260,44));
++            item->setSizeHint(QSize(rx3ui::S(260),rx3ui::S(44)));
+         }
+ 
+         m_level=BrowserLevel::FacetValues;m_sidebar->hide();m_library->hide();m_preview->show();
+@@ -1172,8 +1175,8 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+         const auto color=rx3::sourceColor(rx3::readSourceColor(root)).name();
+         const bool storageShown=m_storageMode && m_pages->currentIndex()==0;
+         m_sourceLabel->setText(storageShown?QStringLiteral("STORAGE"):QString("USB%1").arg(m_usbSlots.value(root)));
+-        m_sourceLabel->setStyleSheet(storageShown?QStringLiteral("background:#303030;color:white;padding:8px;font-size:16px;"):
+-                "background:"+color+";color:white;padding:8px;font-size:16px;");
++        m_sourceLabel->setStyleSheet(rx3ui::qss(QString(storageShown?QStringLiteral("background:#303030;color:white;padding:8px;font-size:16px;"):
++                "background:"+color+";color:white;padding:8px;font-size:16px;")));
+         m_sourceLabel->setVisible(m_pages->currentIndex()!=1 && m_pages->currentWidget()!=m_tools &&
+                 m_pages->currentWidget()!=m_utility && (!root.isEmpty() || storageShown));
+         const int row=m_sources->indexOfTopLevelItem(m_sources->currentItem());
+@@ -1577,6 +1580,7 @@ class WRx3Browser : public QWidget, public WBaseWidget {
+     }
+     void showTools();
+     void showUtility();
++    int queueMissingWaveforms();
+     void closeUtility() {
+         if(m_toolPreview) m_toolPreview->cancel();
+         m_utilitySessionActive=false;
+diff --git a/src/widget/wrx3browsertools.h b/src/widget/wrx3browsertools.h
+index 67286af..fa7868e 100644
+--- a/src/widget/wrx3browsertools.h
++++ b/src/widget/wrx3browsertools.h
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include "widget/rx3ui.h"
+ #include "util/rx3usbstorage.h"
+ 
+ #include <QCryptographicHash>
+diff --git a/src/widget/wrx3browserutility.h b/src/widget/wrx3browserutility.h
+index 6db9ed0..c960107 100644
+--- a/src/widget/wrx3browserutility.h
++++ b/src/widget/wrx3browserutility.h
+@@ -1,8 +1,26 @@
+ #pragma once
+ 
+ #include <QLocale>
++#include <QSqlQuery>
++#include "library/dao/analysisdao.h"
+ #include "version.h"
+ 
++// Queues background waveform analysis for local-library tracks that have no
++// stored waveform summary yet (STORAGE thumbnails read the stored summary).
++inline int WRx3Browser::queueMissingWaveforms() {
++    if(!m_backend || !m_backend->trackCollectionManager() ||
++            !m_backend->trackCollectionManager()->internalCollection()) return 0;
++    QSqlQuery query(m_backend->trackCollectionManager()->internalCollection()->database());
++    QList<AnalyzerScheduledTrack> tracks;
++    if(query.exec(QStringLiteral("SELECT l.id FROM library l JOIN track_locations t ON l.location=t.id "
++            "WHERE l.mixxx_deleted=0 AND t.fs_deleted=0 AND l.id NOT IN "
++            "(SELECT track_id FROM track_analysis WHERE type=%1)").arg(int(AnalysisDao::TYPE_WAVESUMMARY)))) {
++        while(query.next()) tracks.append(AnalyzerScheduledTrack(TrackId(query.value(0))));
++    }
++    if(!tracks.isEmpty()) emit m_backend->analyzeTracks(tracks);
++    return tracks.size();
++}
++
+ inline void WRx3Browser::showUtility() {
+     if(m_pages->currentWidget()==m_utility) return;
+     if(m_utilitySessionActive && m_pages->currentWidget()==m_tools) {
+@@ -78,7 +96,30 @@ inline void WRx3Browser::showUtility() {
+         auto ids=filter.apply(catalog()->tracks());ids.removeAll(m_toolTrack->getSourceBinding().rekordboxId());
+         toolTracks(ids,"RELATED KEY");});
+     action("BROWSER","PREVIEW SELECTED TRACK",[this]{showPreviewTools();});
++    {
++        Setting analyze{"BROWSER","ANALYZE WAVEFORMS (STORAGE)",{},[]{return QString("RUN ›");},{},{},
++                "Scans STORAGE tracks that have no stored waveform yet so their thumbnails appear in BROWSE. Runs in the background; tracks loaded on a deck are analysed automatically."};
++        analyze.execute=[this]{
++            const int queued=queueMissingWaveforms();
++            m_utility->message(queued>0?QString("Analysing %1 track(s) in the background…").arg(queued):
++                    QString("Every STORAGE track already has a stored waveform."));
++        };
++        settings.push_back(std::move(analyze));
++    }
+     action("RECORDING","USB RECORDING",[this]{showRecordingTools();});
++    {
++        QStringList resolutions;QList<double> indexes;
++        for(int i=0;i<rx3ui::kProfileCount;++i) {
++            resolutions<<QString("%1 x %2").arg(rx3ui::kProfiles[i].width).arg(rx3ui::kProfiles[i].height);indexes<<i;
++        }
++        shared("DISPLAY","SCREEN RESOLUTION","display_resolution",resolutions,indexes,
++                "Loads the skin made for that screen size and keeps it as the default at the next start.");
++        shared("DISPLAY","WINDOW MODE","display_mode",{"WINDOWED","FULLSCREEN"},{0,1},
++                "Fullscreen scales the selected skin to fill the screen.");
++        const auto waveforms=WRx3Shortcut::waveformChoices();
++        shared("DISPLAY","WAVEFORM STYLE","waveform_type",waveforms.first,waveforms.second,
++                "OpenGL renderers (SIMPLE to TEXTURED) look best; SOFTWARE and QT styles are for systems without OpenGL shaders.");
++    }
+     shared("DISPLAY","WAVEFORM CURRENT POSITION","waveform_current_position",{"LEFT","CENTER"},{0,1});
+     shared("DISPLAY","WAVEFORM DIVISIONS","waveform_divisions",{"TIME SCALE","PHRASE"},{0,1});
+     if(m_config) {
+diff --git a/src/widget/wrx3countdown.h b/src/widget/wrx3countdown.h
+index a3fd888..28e94fa 100644
+--- a/src/widget/wrx3countdown.h
++++ b/src/widget/wrx3countdown.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "widget/rx3ui.h"
++
+ #include <QElapsedTimer>
+ #include <QFrame>
+ #include <QGridLayout>
+@@ -77,14 +79,14 @@ class WRx3Countdown : public QFrame {
+     WRx3Countdown(UserSettingsPointer config,QWidget* canvas)
+             :QFrame(canvas),m_config(std::move(config)),m_canvas(canvas) {
+         setObjectName("RX3Countdown");setAttribute(Qt::WA_StyledBackground);
+-        setStyleSheet("#RX3Countdown {background:#202020;color:white;border:0;} "
++        setStyleSheet(rx3ui::qss(QString("#RX3Countdown {background:#202020;color:white;border:0;} "
+                 "#RX3Countdown QLabel {color:#ddd;background:transparent;font-family:Arial;font-size:15px;} "
+                 "#RX3Countdown QPushButton {background:#303030;color:#eee;border:1px solid #777;"
+                 "font-family:Arial;font-size:26px;font-weight:normal;padding:2px;} "
+                 "#RX3Countdown QPushButton:pressed {background:#007CE0;} "
+                 "#RX3Countdown QPushButton:disabled {color:#777;border-color:#444;} "
+-                "#RX3Countdown #CountdownReadout {font-size:64px;color:white;background:black;} ");
+-        auto* layout=new QHBoxLayout(this);layout->setContentsMargins(18,16,18,16);layout->setSpacing(20);
++                "#RX3Countdown #CountdownReadout {font-size:64px;color:white;background:black;} ")));
++        auto* layout=new QHBoxLayout(this);layout->setContentsMargins(rx3ui::S(18),rx3ui::S(16),rx3ui::S(18),rx3ui::S(16));layout->setSpacing(rx3ui::S(20));
+         auto* presets=new QVBoxLayout;auto* history=new QVBoxLayout;
+         layout->addLayout(presets,1);layout->addLayout(history,1);
+         presets->addWidget(new QLabel("PRESET",this));history->addWidget(new QLabel("HISTORY",this));
+@@ -97,16 +99,16 @@ class WRx3Countdown : public QFrame {
+             connect(recent,&QPushButton::clicked,this,[this,index]{if(index<m_history.size()) setSeconds(m_history[index]);});
+         }
+         auto* editor=new QFrame(this);editor->setStyleSheet("QFrame {background:black;border:0;}");
+-        layout->addWidget(editor,4);auto* edit=new QVBoxLayout(editor);edit->setContentsMargins(16,12,16,16);edit->setSpacing(14);
++        layout->addWidget(editor,4);auto* edit=new QVBoxLayout(editor);edit->setContentsMargins(rx3ui::S(16),rx3ui::S(12),rx3ui::S(16),rx3ui::S(16));edit->setSpacing(rx3ui::S(14));
+         auto* display=new QHBoxLayout;edit->addLayout(display);
+-        m_readout=new QLabel(this);m_readout->setObjectName("CountdownReadout");m_readout->setAlignment(Qt::AlignCenter);m_readout->setFixedHeight(108);
+-        display->addWidget(m_readout,3);m_start=button("START","Start",display);display->setStretch(1,1);m_start->setFixedHeight(76);
++        m_readout=new QLabel(this);m_readout->setObjectName("CountdownReadout");m_readout->setAlignment(Qt::AlignCenter);m_readout->setFixedHeight(rx3ui::S(108));
++        display->addWidget(m_readout,3);m_start=button("START","Start",display);display->setStretch(1,1);m_start->setFixedHeight(rx3ui::S(76));
+         connect(m_start,&QPushButton::clicked,this,[this]{
+             if(m_timer.running()) m_timer.pause();
+             else if(m_timer.seconds()>0) {remember(m_timer.seconds());m_timer.start();m_digits.clear();}
+             refresh();
+         });
+-        auto* keypad=new QGridLayout;keypad->setSpacing(10);edit->addLayout(keypad,1);
++        auto* keypad=new QGridLayout;keypad->setSpacing(rx3ui::S(10));edit->addLayout(keypad,1);
+         for(int index=0;index<9;++index) {
+             const int digit=9-(index/3)*3-2+index%3;
+             auto* key=new QPushButton(QString::number(digit),this);key->setObjectName("CountdownDigit"+QString::number(digit));
+@@ -177,7 +179,7 @@ class WRx3Countdown : public QFrame {
+     }
+   private:
+     template<class Layout> QPushButton* button(const QString& text,const QString& name,Layout* layout) {
+-        auto* button=new QPushButton(text,this);button->setObjectName("Countdown"+name);button->setMinimumHeight(42);
++        auto* button=new QPushButton(text,this);button->setObjectName("Countdown"+name);button->setMinimumHeight(rx3ui::S(42));
+         button->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Expanding);layout->addWidget(button);return button;
+     }
+     static QString shortText(int seconds) {if(seconds%60) return Rx3Countdown::text(seconds);return QString("%1h:%2m").arg(seconds/3600,2,10,QChar('0')).arg(seconds/60%60,2,10,QChar('0'));}
+diff --git a/src/widget/wrx3deckbadge.h b/src/widget/wrx3deckbadge.h
+index 3cd0ef2..7948e4f 100644
+--- a/src/widget/wrx3deckbadge.h
++++ b/src/widget/wrx3deckbadge.h
+@@ -28,17 +28,19 @@ inline void drawDeckBadge(QPainter* painter, const QRectF& rect, int deck, int s
+     font.setPixelSize(12);
+     painter->setFont(font);
+     painter->setPen(Qt::white);
+-    painter->drawText(QRectF(0, 1, 92, 14), Qt::AlignCenter, QStringLiteral("DECK"));
+-    if (slipEnabled) {
++    // On small screens "DECK" would be unreadable: keep the number, larger.
++    const bool compact = scale < 0.7;
++    if (!compact) painter->drawText(QRectF(0, 1, 92, 14), Qt::AlignCenter, QStringLiteral("DECK"));
++    if (slipEnabled && !compact) {
+         QFont slipFont("Arial");slipFont.setPixelSize(8);painter->setFont(slipFont);
+         painter->setPen(slipLit ? QColor("#FFFF00") : QColor("#555500"));
+         painter->drawText(QRectF(66,2,26,11),Qt::AlignCenter,QStringLiteral("SLIP"));
+         painter->setPen(Qt::white);
+     }
+-    font.setPixelSize(26);
+-    font.setBold(false);
++    font.setPixelSize(compact ? 40 : 26);
++    font.setBold(compact);
+     painter->setFont(font);
+-    painter->drawText(QRectF(0, 13, 92, 31), Qt::AlignCenter, QString::number(deck));
++    painter->drawText(compact ? QRectF(0, 2, 92, 48) : QRectF(0, 13, 92, 31), Qt::AlignCenter, QString::number(deck));
+     painter->setPen(QPen(QColor("#F84418"), 1.4, Qt::SolidLine, Qt::RoundCap));
+     painter->setBrush(Qt::NoBrush);
+     for (int wave = 0; wave < (stage > 0 ? 2 : 0); ++wave) {
+diff --git a/src/widget/wrx3emergency.h b/src/widget/wrx3emergency.h
+index 2afb80e..0a00115 100644
+--- a/src/widget/wrx3emergency.h
++++ b/src/widget/wrx3emergency.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "widget/rx3ui.h"
++
+ #include <QLabel>
+ #include <QPointer>
+ #include <QStackedLayout>
+@@ -37,7 +39,7 @@ class WRx3Emergency : public QObject {
+             auto* parent=stack && stack->count()?stack->widget(0):area;
+             m_message=new QLabel("Cannot play track.\nSome player functions limited.",parent);
+             m_message->setObjectName("RX3EmergencyMessage");m_message->setAlignment(Qt::AlignCenter);
+-            m_message->setStyleSheet("background:black;color:white;border:1px solid white;font-family:Arial;font-size:14px;");
++            m_message->setStyleSheet(rx3ui::qss(QString("background:black;color:white;border:1px solid white;font-family:Arial;font-size:14px;")));
+             m_message->hide();
+         }
+         auto* timer=new QTimer(this);timer->setInterval(100);
+@@ -57,7 +59,7 @@ class WRx3Emergency : public QObject {
+         auto* stack=new QStackedLayout(replacement);stack->setContentsMargins(0,0,0,0);
+         stack->addWidget(original);
+         auto* label=new QLabel(text,replacement);label->setAlignment(Qt::AlignCenter);
+-        label->setStyleSheet("background:black;color:"+QString(text=="EMERGENCY LOOP"?"#ff4000":"#ddd")+";font-family:Arial;font-size:14px;border:0;");
++        label->setStyleSheet(rx3ui::qss(QString("background:black;color:"+QString(text=="EMERGENCY LOOP"?"#ff4000":"#ddd")+";font-family:Arial;font-size:14px;border:0;")));
+         stack->addWidget(label);stack->setCurrentIndex(0);
+         m_masks[deck].push_back({stack,label,text});
+     }
+diff --git a/src/widget/wrx3info.h b/src/widget/wrx3info.h
+index 6946bc4..51e71c5 100644
+--- a/src/widget/wrx3info.h
++++ b/src/widget/wrx3info.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "widget/rx3ui.h"
++
+ #include <QStackedLayout>
+ #include <QTimer>
+ #include <memory>
+@@ -26,12 +28,12 @@ class WRx3Info : public QWidget {
+             delete area->layout();m_stack=new QStackedLayout(area);m_stack->setContentsMargins(0,0,0,0);
+             m_stack->addWidget(original);m_stack->addWidget(this);
+         }
+-        auto* layout=new QHBoxLayout(this);layout->setContentsMargins(0,0,0,0);layout->setSpacing(8);
+-        auto* decks=new QVBoxLayout;decks->setSpacing(8);layout->addLayout(decks);
++        auto* layout=new QHBoxLayout(this);layout->setContentsMargins(0,0,0,0);layout->setSpacing(rx3ui::S(8));
++        auto* decks=new QVBoxLayout;decks->setSpacing(rx3ui::S(8));layout->addLayout(decks);
+         for(int i=0;i<2;++i) {
+             m_decks[i]=new QPushButton(this);m_decks[i]->setObjectName(QString("RX3InfoDeck%1").arg(i+1));
+-            m_decks[i]->setStyleSheet("QPushButton {background:#202020;color:white;border:1px solid #555;font-family:Arial;font-size:17px;text-align:left;padding:8px;border-top:2px solid #00839E;} QPushButton[chosen=\"true\"] {border:1px solid white;border-top:2px solid #00839E;}");
+-            m_decks[i]->setFixedWidth(144);m_decks[i]->setMinimumHeight(130);decks->addWidget(m_decks[i]);
++            m_decks[i]->setStyleSheet(rx3ui::qss(QString("QPushButton {background:#202020;color:white;border:1px solid #555;font-family:Arial;font-size:17px;text-align:left;padding:8px;border-top:2px solid #00839E;} QPushButton[chosen=\"true\"] {border:1px solid white;border-top:2px solid #00839E;}")));
++            m_decks[i]->setFixedWidth(rx3ui::S(144));m_decks[i]->setMinimumHeight(rx3ui::S(130));decks->addWidget(m_decks[i]);
+             m_decks[i]->setAccessibleName(QString("Inspect deck %1").arg(i+1));
+             connect(m_decks[i],&QPushButton::clicked,this,[this,i]{m_deck=i+1;updateTrack();});
+         }
+@@ -40,7 +42,7 @@ class WRx3Info : public QWidget {
+         m_panel->setJump([this](const QString& key,const rx3::InfoTrack& track){if(m_browser) m_browser->infoJump(key,track);});
+         if(auto* label=canvas->findChild<QLabel*>("RX3InfoLabel")) {
+             m_toggle=new QPushButton("◀ INFO",label->parentWidget());m_toggle->setObjectName("RX3InfoToggle");
+-            m_toggle->setAccessibleName("Show or hide track information");m_toggle->setStyleSheet("QPushButton {color:#ddd;background:transparent;border:0;font-family:Arial;font-size:16px;} QPushButton[chosen=\"true\"] {color:#007CE0;}");
++            m_toggle->setAccessibleName("Show or hide track information");m_toggle->setStyleSheet(rx3ui::qss(QString("QPushButton {color:#ddd;background:transparent;border:0;font-family:Arial;font-size:16px;} QPushButton[chosen=\"true\"] {color:#007CE0;}")));
+             if(auto* layout=label->parentWidget()->layout()) {layout->replaceWidget(label,m_toggle);label->hide();}
+             connect(m_toggle,&QPushButton::clicked,this,[this]{setOpen(!m_open);});
+         }
+diff --git a/src/widget/wrx3shortcut.h b/src/widget/wrx3shortcut.h
+index e91419c..58a9d62 100644
+--- a/src/widget/wrx3shortcut.h
++++ b/src/widget/wrx3shortcut.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "widget/rx3ui.h"
++
+ #include <QFile>
+ #include <QSaveFile>
+ #include <QLockFile>
+@@ -33,6 +35,7 @@
+ #include "preferences/usersettings.h"
+ #include "waveform/waveformwidgetfactory.h"
+ #include "widget/rx3mysettings.h"
++#include "widget/rx3waveform.h"
+ #include "widget/rx3mysettingswriter.h"
+ #include <QFutureWatcher>
+ #include <QtConcurrentRun>
+@@ -97,7 +100,7 @@ class WRx3Shortcut : public QFrame {
+     WRx3Shortcut(UserSettingsPointer config,EffectsManager* effects,QWidget* parent)
+             : QFrame(parent),m_config(std::move(config)),m_effects(effects) {
+         setObjectName("RX3Shortcut");setAttribute(Qt::WA_StyledBackground);
+-        setStyleSheet("#RX3Shortcut {background:#000000;color:#fff;} "
++        setStyleSheet(rx3ui::qss(QString("#RX3Shortcut {background:#000000;color:#fff;} "
+                 "#RX3Shortcut QLabel {color:#fff;background:transparent;font-family:Arial;font-size:14px;} "
+                 "#RX3Shortcut QLabel[section=\"true\"] {border-bottom:1px solid #a9a9ad;font-size:15px;} "
+                 "#RX3Shortcut QFrame[encoderFocus=\"true\"] {border:1px solid white;} "
+@@ -106,21 +109,21 @@ class WRx3Shortcut : public QFrame {
+                 "font-family:Arial;font-size:16px;font-weight:normal;padding:3px;} "
+                 "#RX3Shortcut QPushButton[chosen=\"true\"] {background:#007CE0;} "
+                 "#RX3Shortcut QPushButton:disabled {color:#999;border-color:#888;} "
+-                "#RX3Shortcut QLabel#ShortcutStatus {font-size:12px;color:#ddd;}");
+-        auto* layout=new QVBoxLayout(this);layout->setContentsMargins(20,12,20,12);layout->setSpacing(9);
++                "#RX3Shortcut QLabel#ShortcutStatus {font-size:12px;color:#ddd;}")));
++        auto* layout=new QVBoxLayout(this);layout->setContentsMargins(rx3ui::S(20),rx3ui::S(12),rx3ui::S(20),rx3ui::S(12));layout->setSpacing(rx3ui::S(9));
+         layout->setSizeConstraint(QLayout::SetNoConstraint);
+         auto* titleRow=new QHBoxLayout;
+-        auto* title=new QLabel("SHORTCUT",this);title->setStyleSheet("font-size:20px;font-weight:bold;");
++        auto* title=new QLabel("SHORTCUT",this);title->setStyleSheet(rx3ui::qss(QString("font-size:20px;font-weight:bold;")));
+         titleRow->addWidget(title);titleRow->addStretch();
+         auto* closeFrame=new QFrame(this);closeFrame->setObjectName("ShortcutRow_close");
+-        closeFrame->setAttribute(Qt::WA_StyledBackground);closeFrame->setFixedHeight(30);
++        closeFrame->setAttribute(Qt::WA_StyledBackground);closeFrame->setFixedHeight(rx3ui::S(30));
+         auto* closeLayout=new QVBoxLayout(closeFrame);closeLayout->setContentsMargins(0,0,0,0);
+         auto* close=new QPushButton("CLOSE",closeFrame);close->setObjectName("ShortcutClose");
+         closeLayout->addWidget(close);
+         connect(close,&QPushButton::clicked,this,[this]{setVisibleControl(false);});titleRow->addWidget(closeFrame);
+         layout->addLayout(titleRow);
+-        auto* columns=new QHBoxLayout;columns->setSpacing(24);layout->addLayout(columns,1);
+-        auto* left=new QVBoxLayout;auto* right=new QVBoxLayout;left->setSpacing(4);right->setSpacing(12);
++        auto* columns=new QHBoxLayout;columns->setSpacing(rx3ui::S(24));layout->addLayout(columns,1);
++        auto* left=new QVBoxLayout;auto* right=new QVBoxLayout;left->setSpacing(rx3ui::S(4));right->setSpacing(rx3ui::S(2));
+         columns->addLayout(left,3);columns->addLayout(right,2);
+         section(left,"DECK SETTING");
+         auto* deckTop=new QHBoxLayout;left->addLayout(deckTop);
+@@ -153,43 +156,43 @@ class WRx3Shortcut : public QFrame {
+         left->addStretch(1);
+         auto* usb=new QFrame(this);usb->setObjectName("ShortcutUsbBlock");
+         usb->setAttribute(Qt::WA_StyledBackground);
+-        usb->setStyleSheet("#ShortcutUsbBlock {background:#202020;border:0;border-top:2px solid #00839E;}");
++        usb->setStyleSheet(rx3ui::qss(QString("#ShortcutUsbBlock {background:#202020;border:0;border-top:2px solid #00839E;}")));
+         right->addWidget(usb);
+-        auto* usbColumn=new QVBoxLayout(usb);usbColumn->setContentsMargins(0,2,0,0);usbColumn->setSpacing(0);
++        auto* usbColumn=new QVBoxLayout(usb);usbColumn->setContentsMargins(0,rx3ui::S(2),0,0);usbColumn->setSpacing(rx3ui::S(0));
+         m_source=new QLabel("SOURCE — SELECT USB",usb);m_source->setObjectName("ShortcutUsbSlot");
+-        m_source->setFixedHeight(36);m_source->setContentsMargins(14,0,14,0);usbColumn->addWidget(m_source);
++        m_source->setFixedHeight(rx3ui::S(36));m_source->setContentsMargins(rx3ui::S(14),0,rx3ui::S(14),0);usbColumn->addWidget(m_source);
+         auto separator=[usbColumn,usb](int height) {
+-            auto* row=new QHBoxLayout;row->setContentsMargins(12,0,12,0);
++            auto* row=new QHBoxLayout;row->setContentsMargins(rx3ui::S(12),0,rx3ui::S(12),0);
+             auto* line=new QWidget(usb);line->setObjectName("ShortcutUsbSeparator");
+             line->setFixedHeight(height);line->setStyleSheet("background:#000000;");
+             row->addWidget(line);usbColumn->addLayout(row);
+         };
+         separator(1);
+         m_deviceName=new QLabel(usb);m_deviceName->setObjectName("ShortcutUsbDeviceName");
+-        m_deviceName->setFixedHeight(32);m_deviceName->setContentsMargins(14,0,14,0);usbColumn->addWidget(m_deviceName);
++        m_deviceName->setFixedHeight(rx3ui::S(32));m_deviceName->setContentsMargins(rx3ui::S(14),0,rx3ui::S(14),0);usbColumn->addWidget(m_deviceName);
+         separator(2);
+-        auto* sourceRow=new QHBoxLayout;sourceRow->setContentsMargins(0,0,0,0);sourceRow->setSpacing(0);usbColumn->addLayout(sourceRow);
++        auto* sourceRow=new QHBoxLayout;sourceRow->setContentsMargins(0,0,0,0);sourceRow->setSpacing(rx3ui::S(0));usbColumn->addLayout(sourceRow);
+         add(sourceRow,"WAVEFORM COLOR","waveform_color",{"BLUE","RGB","3BAND"},{0,1,2},2);
+-        m_rows.back().frame->setFixedHeight(74);
+-        m_rows.back().frame->layout()->setContentsMargins(8,6,8,6);
++        m_rows.back().frame->setFixedHeight(rx3ui::S(74));
++        m_rows.back().frame->layout()->setContentsMargins(rx3ui::S(8),rx3ui::S(6),rx3ui::S(8),rx3ui::S(6));
+         auto* loadFrame=new QFrame(usb);loadFrame->setObjectName("ShortcutRow_usb_load");
+         loadFrame->setStyleSheet("#ShortcutRow_usb_load {background:#191919;}");
+         loadFrame->setAttribute(Qt::WA_StyledBackground);loadFrame->setProperty("encoderFocus",false);
+-        loadFrame->setFixedHeight(74);sourceRow->addWidget(loadFrame);
+-        auto* loadColumn=new QVBoxLayout(loadFrame);loadColumn->setContentsMargins(10,6,6,6);loadColumn->setSpacing(2);
+-        auto* loadCaption=new QLabel("MY SETTINGS",loadFrame);loadCaption->setFixedHeight(16);loadColumn->addWidget(loadCaption);
+-        m_load=new QPushButton("LOAD",loadFrame);m_load->setFixedHeight(36);m_load->setObjectName("ShortcutSettingsLoad");
++        loadFrame->setFixedHeight(rx3ui::S(74));sourceRow->addWidget(loadFrame);
++        auto* loadColumn=new QVBoxLayout(loadFrame);loadColumn->setContentsMargins(rx3ui::S(10),rx3ui::S(6),rx3ui::S(6),rx3ui::S(6));loadColumn->setSpacing(rx3ui::S(2));
++        auto* loadCaption=new QLabel("MY SETTINGS",loadFrame);loadCaption->setFixedHeight(rx3ui::S(16));loadColumn->addWidget(loadCaption);
++        m_load=new QPushButton("LOAD",loadFrame);m_load->setFixedHeight(rx3ui::S(36));m_load->setObjectName("ShortcutSettingsLoad");
+         auto* settingsActions=new QHBoxLayout;loadColumn->addLayout(settingsActions);settingsActions->addWidget(m_load);
+         connect(m_load,&QPushButton::clicked,this,[this]{loadSettings();});
+         // Include LOAD in encoder focus order; it is an action, not a value.
+-        auto* save=new QPushButton("SAVE",loadFrame);settingsActions->addWidget(save);save->setFixedHeight(36);save->setObjectName("ShortcutSettingsSave");
++        auto* save=new QPushButton("SAVE",loadFrame);settingsActions->addWidget(save);save->setFixedHeight(rx3ui::S(36));save->setObjectName("ShortcutSettingsSave");
+         connect(save,&QPushButton::clicked,this,[this]{saveSettings();});
+         Row saveRow;saveRow.key="usb_save";saveRow.frame=loadFrame;saveRow.buttons={save};m_rows.push_back(saveRow);
+         Row loadRow;loadRow.key="usb_load";loadRow.frame=loadFrame;
+         loadRow.buttons={m_load};m_rows.push_back(loadRow);
+         auto* toolsFrame=new QFrame(this);auto* toolsLayout=new QVBoxLayout(toolsFrame);toolsLayout->setContentsMargins(0,0,0,0);
+         auto* tools=new QPushButton("UTILITY",toolsFrame);
+-        toolsLayout->addWidget(tools);toolsFrame->setFixedHeight(30);titleRow->insertWidget(titleRow->count()-1,toolsFrame);connect(tools,&QPushButton::clicked,this,[this]{openTools();});
++        toolsLayout->addWidget(tools);toolsFrame->setFixedHeight(rx3ui::S(30));titleRow->insertWidget(titleRow->count()-1,toolsFrame);connect(tools,&QPushButton::clicked,this,[this]{openTools();});
+         Row toolsRow;toolsRow.key="browser_tools";toolsRow.frame=toolsFrame;toolsRow.buttons={tools};m_rows.push_back(toolsRow);
+         Row closeRow;closeRow.key="close";closeRow.frame=closeFrame;closeRow.buttons={close};m_rows.push_back(closeRow);
+         section(right,"MIXER SETTING");
+@@ -200,8 +203,25 @@ class WRx3Shortcut : public QFrame {
+         add(mixerBottom,"HEADPHONES","headphones",{"MONO\nSPLIT","STEREO"},{1,0},0);
+         add(mixerBottom,"CROSSFADER CURVE","crossfader_curve",{"SMOOTH","LINEAR","SHARP"},{0,1,2},0,false,true);
+         add(right,"CHANNEL FADER CURVE","channel_curve",{"SMOOTH","LINEAR","SHARP"},{0,1,2},1,false,true);
+-        add(right,"NEEDLE LOCK","needle_lock",{"LOCK","UNLOCK"},{1,0},1);
+-        add(right,"SLIP FLASHING","slip_flashing",{"ON","OFF"},{1,0},1);
++        auto* mixerLocks=new QHBoxLayout;right->addLayout(mixerLocks);
++        add(mixerLocks,"NEEDLE LOCK","needle_lock",{"LOCK","UNLOCK"},{1,0},1);
++        add(mixerLocks,"SLIP FLASHING","slip_flashing",{"ON","OFF"},{1,0},1);
++        // DISPLAY (patches 0050/0051): screen profile, window mode, waveform style.
++        auto* displayTop=new QHBoxLayout;right->addLayout(displayTop);
++        QStringList resolutionLabels;QList<double> resolutionValues;
++        for(int i=0;i<rx3ui::kProfileCount;++i) {
++            resolutionLabels<<QString("%1\n%2").arg(rx3ui::kProfiles[i].width).arg(rx3ui::kProfiles[i].height);
++            resolutionValues<<i;
++        }
++        add(displayTop,"SCREEN","display_resolution",resolutionLabels,resolutionValues,
++                std::max(0,rx3ui::profileIndexForSkin(m_config->getValueString(ConfigKey("[Config]","ResizableSkin")))));
++        add(displayTop,"WINDOW","display_mode",{"WINDOW","FULL"},{0,1},0);
++        const auto waveforms=waveformChoices();
++        if(!waveforms.first.isEmpty()) {
++            add(right,"WAVEFORM STYLE","waveform_type",waveforms.first,waveforms.second,
++                    waveforms.second.value(0),true);
++            m_rows.back().labels=waveforms.first;
++        }
+         right->addStretch(1);
+         m_status=new QLabel("",this);m_status->setMaximumHeight(40);m_status->setObjectName("ShortcutStatus");m_status->setWordWrap(true);
+         auto* statusRow=new QHBoxLayout;statusRow->addWidget(m_status,1);
+@@ -282,7 +302,9 @@ class WRx3Shortcut : public QFrame {
+             const auto saved=ConfigKey("[RX3Settings]",QString("%1%2").arg(key).arg(deck));
+             if(m_config->exists(saved)) deckSettings.insert(QString("%1%2").arg(key).arg(deck),m_config->getValue<double>(saved));
+         }
+-        for(auto& row:m_rows) if(!row.values.isEmpty()) apply(row.key,ControlObject::get(ConfigKey("[RX3Settings]",row.key)));
++        for(auto& row:m_rows) if(!row.values.isEmpty() && !row.key.startsWith("display_") &&
++                row.key!="waveform_type" && row.key!="waveform_color")
++            apply(row.key,ControlObject::get(ConfigKey("[RX3Settings]",row.key)));
+         for(int deck=1;deck<=2;++deck) {
+             const auto key=ConfigKey("[RX3Settings]",QString("quantize%1").arg(deck));
+             if(m_config->exists(key)) ControlObject::set(ConfigKey(QString("[Channel%1]").arg(deck),"quantize"),m_config->getValue<double>(key));
+@@ -353,6 +375,27 @@ class WRx3Shortcut : public QFrame {
+             choose(row,qBound(0,color,2));refresh();return;
+         }
+     }
++    // Waveform styles the running system can render, in display order.
++    static QPair<QStringList,QList<double>> waveformChoices() {
++        QStringList labels;QList<double> values;
++        auto* factory=WaveformWidgetFactory::instance();
++        if(!factory) return {labels,values};
++        const WaveformWidgetType::Type order[]{
++                WaveformWidgetType::AllShaderRGBStackedWaveform,WaveformWidgetType::AllShaderRGBWaveform,
++                WaveformWidgetType::AllShaderSimpleWaveform,WaveformWidgetType::AllShaderFilteredWaveform,
++                WaveformWidgetType::AllShaderLRRGBWaveform,WaveformWidgetType::AllShaderHSVWaveform,
++                WaveformWidgetType::AllShaderTexturedStacked,WaveformWidgetType::AllShaderTexturedRGB,
++                WaveformWidgetType::AllShaderTexturedFiltered,WaveformWidgetType::SoftwareWaveform,
++                WaveformWidgetType::RGBWaveform,WaveformWidgetType::HSVWaveform,
++                WaveformWidgetType::SoftwareSimpleWaveform,WaveformWidgetType::QtWaveform,
++                WaveformWidgetType::QtRGBWaveform,WaveformWidgetType::QtHSVWaveform,
++                WaveformWidgetType::QtSimpleWaveform};
++        for(const auto type:order) {
++            if(factory->findHandleIndexFromType(type)<0) continue;
++            labels<<rx3::waveformTypeLabel(type);values<<double(type);
++        }
++        return {labels,values};
++    }
+     // UTILITY and SHORTCUT use the same setting owners and apply path.
+     double utilityValue(const QString& key) const {
+         if(key=="auto_cue_level") {
+@@ -373,6 +416,9 @@ class WRx3Shortcut : public QFrame {
+     bool utilityAvailable(const QString& key) const {
+         if(key=="load_lock" || key=="needle_lock" || key=="play_mode") return true;
+         if(key=="waveform_current_position" || key=="waveform_divisions") return m_effects && WaveformWidgetFactory::instance();
++        if(key=="display_resolution") return ControlObject::exists(ConfigKey("[RX3Window]","apply_resolution"));
++        if(key=="display_mode") return ControlObject::exists(ConfigKey("[RX3Window]","fullscreen"));
++        if(key=="waveform_type") return WaveformWidgetFactory::instance() && !waveformChoices().second.isEmpty();
+         if(key=="eq_mode") {
+             if(!m_effects || !m_effects->getBackendManager()->getManifestFromUniqueId("org.mixxx.effects.bessel4lvmixeq") ||
+                     !m_effects->getBackendManager()->getManifestFromUniqueId("org.mixxx.effects.biquadfullkilleq")) return false;
+@@ -403,6 +449,14 @@ class WRx3Shortcut : public QFrame {
+             ControlObject::set(ConfigKey("[RX3Settings]",key),value);
+             m_config->setValue(ConfigKey("[RX3Settings]",key),value);m_config->save();return true;
+         }
++        if(key=="display_resolution" || key=="display_mode" || key=="waveform_type") {
++            // Same owners as the SHORTCUT rows, including persistence.
++            for(auto& row:m_rows) if(row.key==key) {
++                const int index=row.values.indexOf(value);if(index<0) return false;
++                choose(row,index);refresh();return true;
++            }
++            apply(key,value);return true;
++        }
+         if(key=="waveform_current_position") {
+             if(value!=0 && value!=1) return false;
+             WaveformWidgetFactory::instance()->setPlayMarkerPosition(value==0?0.25:0.5);m_config->save();return true;
+@@ -455,15 +509,16 @@ class WRx3Shortcut : public QFrame {
+     struct Row {
+         QString key,title;QFrame* frame=nullptr;QVector<QPushButton*> buttons;
+         QList<double> values;double initial=0;bool stepper=false;
++        QStringList labels;
+     };
+     template<class Layout> void add(Layout* layout,const QString& title,const QString& key,
+             QStringList labels,QList<double> values,double initial,bool stepper=false,bool curves=false) {
+         Row row;row.key=key;row.title=title;row.values=values;row.initial=initial;row.stepper=stepper;
+         row.frame=new QFrame(this);row.frame->setObjectName("ShortcutRow_"+key);
+-        row.frame->setAttribute(Qt::WA_StyledBackground);row.frame->setProperty("encoderFocus",false);row.frame->setFixedHeight(60);layout->addWidget(row.frame);
+-        auto* vertical=new QVBoxLayout(row.frame);vertical->setContentsMargins(2,2,2,2);vertical->setSpacing(2);
+-        auto* caption=new QLabel(title,row.frame);caption->setFixedHeight(16);vertical->addWidget(caption);
+-        auto* choices=new QHBoxLayout;choices->setSpacing(0);vertical->addLayout(choices);
++        row.frame->setAttribute(Qt::WA_StyledBackground);row.frame->setProperty("encoderFocus",false);row.frame->setFixedHeight(rx3ui::S(60));layout->addWidget(row.frame);
++        auto* vertical=new QVBoxLayout(row.frame);vertical->setContentsMargins(rx3ui::S(2),rx3ui::S(2),rx3ui::S(2),rx3ui::S(2));vertical->setSpacing(rx3ui::S(2));
++        auto* caption=new QLabel(title,row.frame);caption->setFixedHeight(rx3ui::S(16));vertical->addWidget(caption);
++        auto* choices=new QHBoxLayout;choices->setSpacing(rx3ui::S(0));vertical->addLayout(choices);
+         ensure("[RX3Settings]",key,m_config->getValue<double>(ConfigKey("[RX3Settings]",key),initial));
+         const int rowIndex=int(m_rows.size());
+         for(int i=0;i<(stepper?3:labels.size());++i) {
+@@ -471,22 +526,32 @@ class WRx3Shortcut : public QFrame {
+                     curves?static_cast<QPushButton*>(new Rx3CurveButton(i,key=="crossfader_curve",row.frame)):
+                     new QPushButton(stepper?(i==0?"‹":i==2?"›":"3"):labels[i],row.frame);
+             button->setObjectName("Shortcut_"+key+"_"+QString::number(i));
+-            button->setFixedHeight(36);button->setFixedWidth(key.startsWith("tempo_range")?82:stepper||curves?96:88);
++            const bool labelStepper=stepper && key=="waveform_type";
++            button->setFixedHeight(rx3ui::S(36));
++            button->setFixedWidth(rx3ui::S(labelStepper?(i==1?210:56):key.startsWith("tempo_range")?82:
++                    key=="display_resolution"?66:key=="display_mode"?80:stepper||curves?96:88));
+             button->setSizePolicy(QSizePolicy::Fixed,QSizePolicy::Fixed);
+-            if(labels.value(i)=="MONO\nSPLIT") button->setStyleSheet("font-size:13px;padding:0;");
++            if(labels.value(i).contains('\n')) button->setStyleSheet(rx3ui::qss(QString("font-size:13px;padding:0;")));
+             choices->addWidget(button);row.buttons.append(button);
+             connect(button,&QPushButton::clicked,this,[this,rowIndex,i]{
+                 m_focused=rowIndex;m_editing=true;
+                 auto& selectedRow=m_rows[rowIndex];
+-                choose(selectedRow,selectedRow.stepper?std::clamp(selected(selectedRow)+(i==0?-1:i==2?1:0),
+-                        0,int(selectedRow.values.size())-1):i);refresh();
++                if(!selectedRow.labels.isEmpty()) {
++                    const int count=int(selectedRow.values.size());
++                    const int step=i==0?-1:1;
++                    choose(selectedRow,((qMax(0,selected(selectedRow))+step)%count+count)%count);
++                } else choose(selectedRow,selectedRow.stepper?std::clamp(selected(selectedRow)+(i==0?-1:i==2?1:0),
++                        0,int(selectedRow.values.size())-1):i);
++                refresh();
+             });
+         }
+         choices->addStretch(1);
+-        m_rows.push_back(row);apply(key,ControlObject::get(ConfigKey("[RX3Settings]",key)));
++        m_rows.push_back(row);
++        if(!key.startsWith("display_") && key!="waveform_type" && key!="waveform_color")
++            apply(key,ControlObject::get(ConfigKey("[RX3Settings]",key)));
+     }
+     void section(QVBoxLayout* layout,const QString& text) {
+-        auto* label=new QLabel(text,this);label->setFixedHeight(22);label->setProperty("section",true);label->setStyleSheet("border:0;border-bottom:1px solid #a9a9ad;font-size:15px;");layout->addWidget(label);
++        auto* label=new QLabel(text,this);label->setFixedHeight(rx3ui::S(22));label->setProperty("section",true);label->setStyleSheet(rx3ui::qss(QString("border:0;border-bottom:1px solid #a9a9ad;font-size:15px;")));layout->addWidget(label);
+     }
+     void ensure(const QString& group,const QString& key,double initial) {
+         if(!ControlObject::exists(ConfigKey(group,key))) m_owners.push_back(
+@@ -511,6 +576,17 @@ class WRx3Shortcut : public QFrame {
+             }
+             return value;
+         }
++        if(row.key=="display_resolution") return rx3ui::profileIndexForSkin(
++                m_config->getValueString(ConfigKey("[Config]","ResizableSkin")));
++        if(row.key=="display_mode") return ControlObject::exists(ConfigKey("[RX3Window]","fullscreen"))?
++                ControlObject::get(ConfigKey("[RX3Window]","fullscreen")):0;
++        if(row.key=="waveform_type") return WaveformWidgetFactory::instance()?
++                double(WaveformWidgetFactory::instance()->getType()):-999;
++        if(row.key=="waveform_color") {
++            const auto type=WaveformWidgetFactory::instance()?WaveformWidgetFactory::instance()->getType():WaveformWidgetType::Count_WaveformwidgetType;
++            return type==WaveformWidgetType::AllShaderSimpleWaveform?0:type==WaveformWidgetType::AllShaderRGBWaveform?1:
++                    type==WaveformWidgetType::AllShaderRGBStackedWaveform?2:-999;
++        }
+         const QMap<QString,QString> live{{"quantize_beat","rx3_quantize_beats"},
+                 {"hotcue_autoload","rx3_hotcue_autoload"},{"slip_flashing","slip_flashing"},
+                 {"channel_curve","channel_fader_curve"}};
+@@ -575,6 +651,19 @@ class WRx3Shortcut : public QFrame {
+             m_config->setValue(ConfigKey("[Mixer Profile]","xFaderCurve"),curve);
+         } else if(key=="channel_curve") {
+             for(int deck=1;deck<=2;++deck) set(QString("[Channel%1]").arg(deck),"channel_fader_curve",value);
++        } else if(key=="display_resolution") {
++            const int index=qBound(0,qRound(value),rx3ui::kProfileCount-1);
++            if(rx3ui::profileIndexForSkin(m_config->getValueString(ConfigKey("[Config]","ResizableSkin")))!=index) {
++                m_config->setValue(ConfigKey("[RX3Window]","Resolution"),index);m_config->save();
++                set("[RX3Window]","apply_resolution",1);set("[RX3Window]","apply_resolution",0);
++            }
++        } else if(key=="display_mode") {
++            set("[RX3Window]","fullscreen",value>0.5?1:0);
++        } else if(key=="waveform_type" && WaveformWidgetFactory::instance()) {
++            auto* factory=WaveformWidgetFactory::instance();
++            const auto type=static_cast<WaveformWidgetType::Type>(qRound(value));
++            const int handle=factory->findHandleIndexFromType(type);
++            if(handle>=0 && factory->getType()!=type) factory->setWidgetTypeFromHandle(handle);
+         } else if(key=="waveform_color" && m_effects) {
+             const WaveformWidgetType::Type types[]{WaveformWidgetType::AllShaderSimpleWaveform,
+                     WaveformWidgetType::AllShaderRGBWaveform,WaveformWidgetType::AllShaderRGBStackedWaveform};
+@@ -643,7 +732,8 @@ class WRx3Shortcut : public QFrame {
+             const int index=selected(row);
+             for(int j=0;j<row.buttons.size();++j) {
+                 auto* button=row.buttons[j];button->setProperty("chosen",row.stepper?j==1:j==index);
+-                if(row.stepper && j==1) button->setText(index>=0?QString::number(row.values[index]):QString("MIXED"));
++                if(row.stepper && j==1) button->setText(index>=0?(row.labels.isEmpty()?QString::number(row.values[index]):
++                        row.labels.value(index)):QString("MIXED"));
+                 button->style()->unpolish(button);button->style()->polish(button);button->update();
+             }
+         }
+diff --git a/src/widget/wrx3toolmenu.h b/src/widget/wrx3toolmenu.h
+index 4f07651..95b5782 100644
+--- a/src/widget/wrx3toolmenu.h
++++ b/src/widget/wrx3toolmenu.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "widget/rx3ui.h"
++
+ #include <QLabel>
+ #include <QListWidget>
+ #include <QPushButton>
+@@ -23,12 +25,12 @@ class WRx3ToolMenu : public QWidget {
+     };
+     explicit WRx3ToolMenu(QWidget* parent) : QWidget(parent) {
+         setObjectName("RX3BrowserTools");
+-        setStyleSheet("#RX3BrowserTools {background:#202020;color:white;} #RX3BrowserTools QLabel {color:white;font-family:Arial;font-size:16px;} #RX3BrowserTools QListWidget {background:#202020;color:white;border:0;font-family:Arial;font-size:16px;} #RX3BrowserTools QPushButton {background:#202020;color:white;border:1px solid white;min-height:36px;} #RX3ToolsBack[encoderFocus=\"true\"] {background:#007CE0;color:white;}");
++        setStyleSheet(rx3ui::qss(QString("#RX3BrowserTools {background:#202020;color:white;} #RX3BrowserTools QLabel {color:white;font-family:Arial;font-size:16px;} #RX3BrowserTools QListWidget {background:#202020;color:white;border:0;font-family:Arial;font-size:16px;} #RX3BrowserTools QPushButton {background:#202020;color:white;border:1px solid white;min-height:36px;} #RX3ToolsBack[encoderFocus=\"true\"] {background:#007CE0;color:white;}")));
+         auto* layout=new QVBoxLayout(this);
+         m_title=new QLabel(this);layout->addWidget(m_title);
+         m_list=new QListWidget(this);m_list->setObjectName("RX3ToolsActions");
+         m_list->setAlternatingRowColors(true);
+-        m_list->setStyleSheet("QListWidget {background:#000;alternate-background-color:#262626;} QListWidget::item {min-height:40px;border:0;} QListWidget::item:selected {background:#007CE0;color:white;}");
++        m_list->setStyleSheet(rx3ui::qss(QString("QListWidget {background:#000;alternate-background-color:#262626;} QListWidget::item {min-height:40px;border:0;} QListWidget::item:selected {background:#007CE0;color:white;}")));
+         layout->addWidget(m_list,1);
+         m_status=new QLabel(this);m_status->setObjectName("RX3ToolsStatus");m_status->setWordWrap(true);layout->addWidget(m_status);
+         m_backButton=new QPushButton("BACK",this);m_backButton->setObjectName("RX3ToolsBack");layout->addWidget(m_backButton);
+diff --git a/src/widget/wrx3trackinfo.h b/src/widget/wrx3trackinfo.h
+index bdae415..719b32f 100644
+--- a/src/widget/wrx3trackinfo.h
++++ b/src/widget/wrx3trackinfo.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "widget/rx3ui.h"
++
+ #include <QFrame>
+ #include <QHBoxLayout>
+ #include <QLabel>
+@@ -56,21 +58,21 @@ class Rx3TrackInfoPanel : public QFrame {
+     explicit Rx3TrackInfoPanel(RekordboxFeature* feature,QWidget* parent=nullptr)
+             :QFrame(parent),m_feature(feature) {
+         setObjectName("RX3DetailedInfo");setAttribute(Qt::WA_StyledBackground);
+-        setStyleSheet("#RX3DetailedInfo {background:#000;color:white;border:0;} "
++        setStyleSheet(rx3ui::qss(QString("#RX3DetailedInfo {background:#000;color:white;border:0;} "
+             "#RX3DetailedInfo QListWidget {background:#202020;color:white;border:0;font-family:Arial;font-size:19px;} "
+             "#RX3DetailedInfo QListWidget::item {padding:3px 12px;border-bottom:1px solid #303030;} "
+             "#RX3DetailedInfo QListWidget::item:selected {background:#007CE0;} "
+             "#RX3DetailedInfo QLabel {color:white;background:transparent;font-family:Arial;font-size:18px;} "
+             "#RX3DetailedInfo QPushButton {background:#202020;color:white;border:1px solid #777;font-family:Arial;font-size:18px;} "
+-            "#RX3DetailedInfo QPushButton[chosen=\"true\"] {background:#007CE0;}");
+-        auto* layout=new QHBoxLayout(this);layout->setContentsMargins(8,0,8,0);layout->setSpacing(16);
++            "#RX3DetailedInfo QPushButton[chosen=\"true\"] {background:#007CE0;}")));
++        auto* layout=new QHBoxLayout(this);layout->setContentsMargins(rx3ui::S(8),0,rx3ui::S(8),0);layout->setSpacing(rx3ui::S(16));
+         m_fields=new QListWidget(this);m_fields->setObjectName("RX3InfoFields");
+         m_fields->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);layout->addWidget(m_fields,6);
+         const QStringList names={"Title","Artist","Album","Duration","BPM","Key","Rating","Color","Genre","Date added"};
+         for(const auto& name:names) {auto* item=new QListWidgetItem(m_fields);item->setData(Qt::AccessibleTextRole,name);}
+         m_fields->setCurrentRow(0);
+         connect(m_fields,&QListWidget::itemClicked,this,[this](QListWidgetItem*){enter();});
+-        auto* right=new QVBoxLayout;right->setSpacing(10);layout->addLayout(right,5);
++        auto* right=new QVBoxLayout;right->setSpacing(rx3ui::S(10));layout->addLayout(right,5);
+         m_trackNumber=new QLabel(this);m_trackNumber->setAlignment(Qt::AlignCenter);right->addWidget(m_trackNumber);
+         m_artwork=new QLabel(this);m_artwork->setAlignment(Qt::AlignCenter);m_artwork->setMinimumSize(1,1);right->addWidget(m_artwork,1);
+         m_comment=new QLabel(this);m_comment->setWordWrap(true);right->addWidget(m_comment,1);
+diff --git a/src/widget/wrx3utility.h b/src/widget/wrx3utility.h
+index d5802b2..1c2ef54 100644
+--- a/src/widget/wrx3utility.h
++++ b/src/widget/wrx3utility.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "widget/rx3ui.h"
++
+ #include <QComboBox>
+ #include <QHeaderView>
+ #include <QLabel>
+@@ -41,7 +43,7 @@ class WRx3Utility : public QWidget {
+     };
+     explicit WRx3Utility(QWidget* parent) : QWidget(parent) {
+         setObjectName("RX3Utility");
+-        setStyleSheet("#RX3Utility {background:#202020;color:white;} "
++        setStyleSheet(rx3ui::qss(QString("#RX3Utility {background:#202020;color:white;} "
+                 "#RX3Utility QTableWidget {background:#000;alternate-background-color:#262626;color:white;border:0;font:16px Arial;} "
+                 "#RX3Utility QTableWidget::item {padding:8px;border:0;} "
+                 "#RX3Utility QTableWidget::item:selected {background:#007CE0;color:white;} "
+@@ -49,9 +51,9 @@ class WRx3Utility : public QWidget {
+                 "#RX3Utility QComboBox QAbstractItemView {background:#202020;color:white;selection-background-color:#007CE0;} "
+                 "#RX3Utility QLabel {color:white;font:14px Arial;} "
+                 "#RX3Utility QPushButton {background:#202020;color:white;border:1px solid #aaa;min-height:36px;} "
+-                "#RX3UtilityBack[encoderFocus=\"true\"] {background:#007CE0;}");
++                "#RX3UtilityBack[encoderFocus=\"true\"] {background:#007CE0;}")));
+         auto* layout = new QVBoxLayout(this);
+-        layout->setContentsMargins(0,0,0,8);
++        layout->setContentsMargins(0,0,0,rx3ui::S(8));
+         m_table = new Rx3UtilityTable(this);
+         m_table->setObjectName("RX3UtilitySettings");
+         m_table->setColumnCount(2);
+@@ -92,13 +94,13 @@ class WRx3Utility : public QWidget {
+                 header->setFlags(Qt::ItemIsEnabled);header->setBackground(QColor("#303030"));
+                 auto font=header->font();font.setBold(true);header->setFont(font);
+                 m_table->setItem(row,0,header);m_table->setSpan(row,0,1,2);
+-                m_table->setRowHeight(row,34);
++                m_table->setRowHeight(row,rx3ui::S(34));
+             }
+             const int row=m_table->rowCount();m_table->insertRow(row);
+             m_settingRows.push_back(row);
+             m_table->setItem(row,0,new QTableWidgetItem(setting.name));
+             m_table->setItem(row,1,new QTableWidgetItem);
+-            m_table->setRowHeight(row,42);
++            m_table->setRowHeight(row,rx3ui::S(42));
+         }
+         focus(0);refresh();m_table->scrollToTop();
+     }
